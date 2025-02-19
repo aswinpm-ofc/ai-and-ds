@@ -1,17 +1,19 @@
+
 import sympy as sp
 
 def forward_difference(f_expr, x_val, h_val):
-    x = sp.symbols('x') 
+    x = sp.symbols('x')  
     f = sp.lambdify(x, f_expr, 'math') 
     return (f(x_val + h_val) - f(x_val)) / h_val
 
 
-f_input = input("Enter the function f(x): ")  
+f_input = input("Enter the function f(x) in terms of x: ")
 x_value = float(input("Enter the value of x: "))
 h_value = float(input("Enter the step size h: "))
 
+
 x = sp.symbols('x')
-f_expression = sp.sympify(f_input)
+f_expression = sp.sympify(f_input, locals={'e': sp.exp(1)}) 
 
 
 approx_derivative = forward_difference(f_expression, x_value, h_value)
