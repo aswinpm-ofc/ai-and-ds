@@ -1,0 +1,30 @@
+def lagrange_interpolation(x_values, y_values, x):
+    result = 0
+    n = len(x_values)
+    
+    for i in range(n):
+        term = y_values[i]
+        
+        for j in range(n):
+            if j != i:
+                term *= (x - x_values[j]) / (x_values[i] - x_values[j])
+        
+        result += term
+    
+    return result
+
+n = int(input("Enter the number of data points: "))
+x_values = []
+y_values = []
+
+for i in range(n):
+    x = float(input(f"Enter x[{i}]: "))
+    y = float(input(f"Enter y[{i}]: "))
+    x_values.append(x)
+    y_values.append(y)
+
+x_to_estimate = float(input("Enter the value of x to estimate the y value: "))
+
+estimated_value = lagrange_interpolation(x_values, y_values, x_to_estimate)
+
+print(f"The estimated value at x = {x_to_estimate} is: {estimated_value}")
