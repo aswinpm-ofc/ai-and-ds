@@ -1,0 +1,5205 @@
+﻿#!/usr/bin/env python3
+"""
+train_from_csv.py
+
+Train a simple PyTorch linear regression model using an EXTERNAL CSV dataset.
+
+Usage examples:
+    python train_from_csv.py --csv student_scores.csv --target score --epochs 50 --batch-size 8
+
+Requirements:
+    pip install numpy pandas scikit-learn torch matplotlib
+"""
+import os
+import time
+import argparse
+import numpy as np
+import pandas as pd
+import pickle
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error, r2_score
+
+import torch
+from torch import nn
+from torch.utils.data import TensorDataset, DataLoader
+
+class LinearRegressionTorch(nn.Module):
+    def __init__(self, n_features):
+        super().__init__()
+        self.linear = nn.Linear(n_features, 1)
+
+    def forward(self, x):
+        return self.linear(x).squeeze(1)
+
+
+
+def train_model(model, optimizer, criterion, dataloader, device, epochs=10, verbose=True):
+    model.train()
+    history = []
+    for epoch in range(1, epochs+1):
+        t0 = time.time()
+        running_loss = 0.0
+        batches = 0
+        for xb, yb in dataloader:
+            xb = xb.to(device)
+            yb = yb.to(device)
+            optimizer.zero_grad()
+            pred = model(xb)
+            loss = criterion(pred, yb)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item()
+            batches += 1
+        epoch_time = time.time() - t0
+        avg_loss = running_loss / max(1, batches)
+        history.append({"epoch": epoch, "loss": avg_loss, "time_s": epoch_time})
+        if verbose:
+            print(f"Epoch {epoch:03d}: loss={avg_loss:.6f}  time={epoch_time:.3f}s")
+    return history
+
+def load_csv_dataset(csv_path, target_col=None):
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"CSV not found: {csv_path}")
+    df = pd.read_csv(csv_path)
+    if df.shape[0] == 0:
+        raise ValueError("CSV appears empty.")
+    if target_col is None:
+        if "y" in df.columns:
+            target_col = "y"
+        else:
+            target_col = df.columns[-1]
+            print(f"No target specified; using last column as target: '{target_col}'")
+    if target_col not in df.columns:
+        raise ValueError(f"Target column '{target_col}' not found in CSV columns: {list(df.columns)}")
+    X_df = df.drop(columns=[target_col]).copy()
+    y_ser = df[target_col].copy()
+    try:
+        X_num = X_df.apply(pd.to_numeric)
+        y_num = pd.to_numeric(y_ser)
+    except Exception as e:
+        raise ValueError("Failed to convert columns to numeric. Ensure all feature columns are numeric.") from e
+    X = X_num.values.astype(np.float32)
+    y = y_num.values.astype(np.float32)
+    feature_names = list(X_df.columns)
+    return X, y, feature_names
+
+def main():
+    parser = argparse.ArgumentParser(description="Train a PyTorch linear regression from an external CSV file.")
+    parser.add_argument("--csv", type=str, required=True, help="Path to input CSV file (must exist).")
+    parser.add_argument("--target", type=str, default=None, help="Name of target column. If omitted uses 'y' if present, otherwise last column.")
+    parser.add_argument("--out", type=str, default="out_reg_csv", help="Directory to save outputs.")
+    parser.add_argument("--test-size", type=float, default=0.2, help="Fraction of data reserved for test.")
+    parser.add_argument("--batch-size", type=int, default=1024, help="Training batch size.")
+    parser.add_argument("--epochs", type=int, default=20, help="Number of training epochs.")
+    parser.add_argument("--lr", type=float, default=0.01, help="Learning rate for SGD.")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed.")
+    args = parser.parse_args()
+
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
+    os.makedirs(args.out, exist_ok=True)
+
+    print("Loading CSV dataset...")
+    X, y, feature_names = load_csv_dataset(args.csv, target_col=args.target)
+    n_samples, n_features = X.shape
+    print(f"Loaded dataset with {n_samples} samples and {n_features} features.")
+    print("Feature columns:", feature_names)
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=args.test_size, random_state=args.seed, shuffle=True)
+    print(f"Train samples: {len(X_train)}, Test samples: {len(X_test)}")
+
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+
+    scaler_path = os.path.join(args.out, "scaler.pkl")
+    with open(scaler_path, "wb") as f:
+        pickle.dump(scaler, f)
+    print("Saved scaler to:", scaler_path)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Using device:", device)
+
+    train_ds = TensorDataset(torch.from_numpy(X_train_scaled.astype(np.float32)), torch.from_numpy(y_train.astype(np.float32)))
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=False)
+
+    model = LinearRegressionTorch(n_features=n_features).to(device)
+    optimizer = torch.optim.SGD(model.parameters(), lr=args.lr)
+    criterion = nn.MSELoss()
+
+    print("\nStarting training...")
+    history = train_model(model, optimizer, criterion, train_loader, device, epochs=args.epochs, verbose=True)
+
+    model_path = os.path.join(args.out, "torch_linear_model.pth")
+    torch.save(model.state_dict(), model_path)
+    print("Saved model state to:", model_path)
+
+    model.eval()
+    with torch.no_grad():
+        X_test_t = torch.from_numpy(X_test_scaled.astype(np.float32)).to(device)
+        y_pred_t = model(X_test_t).cpu().numpy()
+    mse = mean_squared_error(y_test, y_pred_t)
+    rmse = np.sqrt(mse)
+    r2 = r2_score(y_test, y_pred_t)
+
+    print("\n=== Final evaluation on test set ===")
+    print(f"MSE  : {mse:.6f}")
+    print(f"RMSE : {rmse:.6f}")
+    print(f"R^2  : {r2:.6f}")
+
+    nsave = min(5000, len(y_test))
+    preds_df = pd.DataFrame(X_test[:nsave], columns=feature_names)
+    preds_df["y_true"] = y_test[:nsave]
+    preds_df["y_pred"] = y_pred_t[:nsave]
+    preds_csv = os.path.join(args.out, "predictions_preview.csv")
+    preds_df.to_csv(preds_csv, index=False)
+    print("Saved prediction preview to:", preds_csv)
+
+    hist_df = pd.DataFrame(history)
+    hist_csv = os.path.join(args.out, "training_history.csv")
+    hist_df.to_csv(hist_csv, index=False)
+    print("Saved training history (epoch loss/time) to:", hist_csv)
+
+    print("\nSample predictions (first 10 rows of preview):")
+    for i in range(min(10, len(preds_df))):
+        row = preds_df.iloc[i]
+        feats = ", ".join([f"{c}={row[c]:.3f}" for c in feature_names])
+        print(f"row {i}: {feats}  | true={row['y_true']:.3f}  pred={row['y_pred']:.3f}")
+
+    print("\nArtifacts saved in:", args.out)
+    print(" - model state:", model_path)
+    print(" - scaler:", scaler_path)
+    print(" - predictions preview:", preds_csv)
+    print(" - training history:", hist_csv)
+
+if __name__ == "__main__":
+    main()
+...........................................................................
+Windows PowerShell
+Copyright (C) Microsoft Corporation. All rights reserved.
+
+Install the latest PowerShell for new features and improvements! https://aka.ms/PSWindows
+
+Loading personal and system profiles took 2073ms.
+(base) PS C:\Users\aswin\Desktop\csai\regression> python -m venv venv
+(base) PS C:\Users\aswin\Desktop\csai\regression> .\venv\Scripts\Activate.ps1
+(venv) (base) PS C:\Users\aswin\Desktop\csai\regression> python -m pip install --upgrade pip
+Requirement already satisfied: pip in c:\users\aswin\desktop\csai\regression\venv\lib\site-packages (23.2.1)
+Collecting pip
+  Obtaining dependency information for pip from https://files.pythonhosted.org/packages/44/3c/d717024885424591d5376220b5e836c2d5293ce2011523c9de23ff7bf068/pip-25.3-py3-none-any.whl.metadata
+  Downloading pip-25.3-py3-none-any.whl.metadata (4.7 kB)
+Downloading pip-25.3-py3-none-any.whl (1.8 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1.8/1.8 MB 11.3 MB/s eta 0:00:00
+Installing collected packages: pip
+  Attempting uninstall: pip
+    Found existing installation: pip 23.2.1
+    Uninstalling pip-23.2.1:
+      Successfully uninstalled pip-23.2.1
+Successfully installed pip-25.3
+(venv) (base) PS C:\Users\aswin\Desktop\csai\regression> pip install numpy pandas scikit-learn matplotlib torch
+Collecting numpy
+  Downloading numpy-2.3.4-cp311-cp311-win_amd64.whl.metadata (60 kB)
+Collecting pandas
+  Downloading pandas-2.3.3-cp311-cp311-win_amd64.whl.metadata (19 kB)
+Collecting scikit-learn
+  Downloading scikit_learn-1.7.2-cp311-cp311-win_amd64.whl.metadata (11 kB)
+Collecting matplotlib
+  Downloading matplotlib-3.10.7-cp311-cp311-win_amd64.whl.metadata (11 kB)
+Collecting torch
+  Downloading torch-2.9.0-cp311-cp311-win_amd64.whl.metadata (30 kB)
+Collecting python-dateutil>=2.8.2 (from pandas)
+  Using cached python_dateutil-2.9.0.post0-py2.py3-none-any.whl.metadata (8.4 kB)
+Collecting pytz>=2020.1 (from pandas)
+  Using cached pytz-2025.2-py2.py3-none-any.whl.metadata (22 kB)
+Collecting tzdata>=2022.7 (from pandas)
+  Using cached tzdata-2025.2-py2.py3-none-any.whl.metadata (1.4 kB)
+Collecting scipy>=1.8.0 (from scikit-learn)
+  Downloading scipy-1.16.3-cp311-cp311-win_amd64.whl.metadata (60 kB)
+Collecting joblib>=1.2.0 (from scikit-learn)
+  Downloading joblib-1.5.2-py3-none-any.whl.metadata (5.6 kB)
+Collecting threadpoolctl>=3.1.0 (from scikit-learn)
+  Downloading threadpoolctl-3.6.0-py3-none-any.whl.metadata (13 kB)
+Collecting contourpy>=1.0.1 (from matplotlib)
+  Downloading contourpy-1.3.3-cp311-cp311-win_amd64.whl.metadata (5.5 kB)
+Collecting cycler>=0.10 (from matplotlib)
+  Using cached cycler-0.12.1-py3-none-any.whl.metadata (3.8 kB)
+Collecting fonttools>=4.22.0 (from matplotlib)
+  Downloading fonttools-4.60.1-cp311-cp311-win_amd64.whl.metadata (114 kB)
+Collecting kiwisolver>=1.3.1 (from matplotlib)
+  Downloading kiwisolver-1.4.9-cp311-cp311-win_amd64.whl.metadata (6.4 kB)
+Collecting packaging>=20.0 (from matplotlib)
+  Using cached packaging-25.0-py3-none-any.whl.metadata (3.3 kB)
+Collecting pillow>=8 (from matplotlib)
+  Downloading pillow-12.0.0-cp311-cp311-win_amd64.whl.metadata (9.0 kB)
+Collecting pyparsing>=3 (from matplotlib)
+  Downloading pyparsing-3.2.5-py3-none-any.whl.metadata (5.0 kB)
+Collecting filelock (from torch)
+  Downloading filelock-3.20.0-py3-none-any.whl.metadata (2.1 kB)
+Collecting typing-extensions>=4.10.0 (from torch)
+  Downloading typing_extensions-4.15.0-py3-none-any.whl.metadata (3.3 kB)
+Collecting sympy>=1.13.3 (from torch)
+  Downloading sympy-1.14.0-py3-none-any.whl.metadata (12 kB)
+Collecting networkx>=2.5.1 (from torch)
+  Downloading networkx-3.5-py3-none-any.whl.metadata (6.3 kB)
+Collecting jinja2 (from torch)
+  Downloading jinja2-3.1.6-py3-none-any.whl.metadata (2.9 kB)
+Collecting fsspec>=0.8.5 (from torch)
+  Downloading fsspec-2025.10.0-py3-none-any.whl.metadata (10 kB)
+Collecting six>=1.5 (from python-dateutil>=2.8.2->pandas)
+  Using cached six-1.17.0-py2.py3-none-any.whl.metadata (1.7 kB)
+Collecting mpmath<1.4,>=1.1.0 (from sympy>=1.13.3->torch)
+  Using cached mpmath-1.3.0-py3-none-any.whl.metadata (8.6 kB)
+Collecting MarkupSafe>=2.0 (from jinja2->torch)
+  Downloading markupsafe-3.0.3-cp311-cp311-win_amd64.whl.metadata (2.8 kB)
+Downloading numpy-2.3.4-cp311-cp311-win_amd64.whl (13.1 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 13.1/13.1 MB 27.4 MB/s  0:00:00
+Downloading pandas-2.3.3-cp311-cp311-win_amd64.whl (11.3 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 11.3/11.3 MB 25.3 MB/s  0:00:00
+Downloading scikit_learn-1.7.2-cp311-cp311-win_amd64.whl (8.9 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 8.9/8.9 MB 24.0 MB/s  0:00:00
+Downloading matplotlib-3.10.7-cp311-cp311-win_amd64.whl (8.1 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 8.1/8.1 MB 15.2 MB/s  0:00:00
+Downloading torch-2.9.0-cp311-cp311-win_amd64.whl (109.3 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 0.0/109.3 MB ? eta -:--:--ERROR: Could not install packages due to an OSError: [Errno 28] No space left on device
+
+   ━╸━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 4.7/109.3 MB 35.7 MB/s eta 0:00:03
+(venv) (base) PS C:\Users\aswin\Desktop\csai\regression> pip install numpy pandas scikit-learn matplotlib torch
+Collecting numpy
+  Using cached numpy-2.3.4-cp311-cp311-win_amd64.whl.metadata (60 kB)
+Collecting pandas
+  Using cached pandas-2.3.3-cp311-cp311-win_amd64.whl.metadata (19 kB)
+Collecting scikit-learn
+  Using cached scikit_learn-1.7.2-cp311-cp311-win_amd64.whl.metadata (11 kB)
+Collecting matplotlib
+  Using cached matplotlib-3.10.7-cp311-cp311-win_amd64.whl.metadata (11 kB)
+Collecting torch
+  Using cached torch-2.9.0-cp311-cp311-win_amd64.whl.metadata (30 kB)
+Collecting python-dateutil>=2.8.2 (from pandas)
+  Using cached python_dateutil-2.9.0.post0-py2.py3-none-any.whl.metadata (8.4 kB)
+Collecting pytz>=2020.1 (from pandas)
+  Using cached pytz-2025.2-py2.py3-none-any.whl.metadata (22 kB)
+Collecting tzdata>=2022.7 (from pandas)
+  Using cached tzdata-2025.2-py2.py3-none-any.whl.metadata (1.4 kB)
+Collecting scipy>=1.8.0 (from scikit-learn)
+  Using cached scipy-1.16.3-cp311-cp311-win_amd64.whl.metadata (60 kB)
+Collecting joblib>=1.2.0 (from scikit-learn)
+  Using cached joblib-1.5.2-py3-none-any.whl.metadata (5.6 kB)
+Collecting threadpoolctl>=3.1.0 (from scikit-learn)
+  Using cached threadpoolctl-3.6.0-py3-none-any.whl.metadata (13 kB)
+Collecting contourpy>=1.0.1 (from matplotlib)
+  Using cached contourpy-1.3.3-cp311-cp311-win_amd64.whl.metadata (5.5 kB)
+Collecting cycler>=0.10 (from matplotlib)
+  Using cached cycler-0.12.1-py3-none-any.whl.metadata (3.8 kB)
+Collecting fonttools>=4.22.0 (from matplotlib)
+  Using cached fonttools-4.60.1-cp311-cp311-win_amd64.whl.metadata (114 kB)
+Collecting kiwisolver>=1.3.1 (from matplotlib)
+  Using cached kiwisolver-1.4.9-cp311-cp311-win_amd64.whl.metadata (6.4 kB)
+Collecting packaging>=20.0 (from matplotlib)
+  Using cached packaging-25.0-py3-none-any.whl.metadata (3.3 kB)
+Collecting pillow>=8 (from matplotlib)
+  Using cached pillow-12.0.0-cp311-cp311-win_amd64.whl.metadata (9.0 kB)
+Collecting pyparsing>=3 (from matplotlib)
+  Using cached pyparsing-3.2.5-py3-none-any.whl.metadata (5.0 kB)
+Collecting filelock (from torch)
+  Using cached filelock-3.20.0-py3-none-any.whl.metadata (2.1 kB)
+Collecting typing-extensions>=4.10.0 (from torch)
+  Using cached typing_extensions-4.15.0-py3-none-any.whl.metadata (3.3 kB)
+Collecting sympy>=1.13.3 (from torch)
+  Using cached sympy-1.14.0-py3-none-any.whl.metadata (12 kB)
+Collecting networkx>=2.5.1 (from torch)
+  Using cached networkx-3.5-py3-none-any.whl.metadata (6.3 kB)
+Collecting jinja2 (from torch)
+  Using cached jinja2-3.1.6-py3-none-any.whl.metadata (2.9 kB)
+Collecting fsspec>=0.8.5 (from torch)
+  Using cached fsspec-2025.10.0-py3-none-any.whl.metadata (10 kB)
+Collecting six>=1.5 (from python-dateutil>=2.8.2->pandas)
+  Using cached six-1.17.0-py2.py3-none-any.whl.metadata (1.7 kB)
+Collecting mpmath<1.4,>=1.1.0 (from sympy>=1.13.3->torch)
+  Using cached mpmath-1.3.0-py3-none-any.whl.metadata (8.6 kB)
+Collecting MarkupSafe>=2.0 (from jinja2->torch)
+  Using cached markupsafe-3.0.3-cp311-cp311-win_amd64.whl.metadata (2.8 kB)
+Using cached numpy-2.3.4-cp311-cp311-win_amd64.whl (13.1 MB)
+Using cached pandas-2.3.3-cp311-cp311-win_amd64.whl (11.3 MB)
+Using cached scikit_learn-1.7.2-cp311-cp311-win_amd64.whl (8.9 MB)
+Downloading matplotlib-3.10.7-cp311-cp311-win_amd64.whl (8.1 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 8.1/8.1 MB 20.1 MB/s  0:00:00
+Downloading torch-2.9.0-cp311-cp311-win_amd64.whl (109.3 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 109.3/109.3 MB 28.5 MB/s  0:00:03
+Downloading contourpy-1.3.3-cp311-cp311-win_amd64.whl (225 kB)
+Using cached cycler-0.12.1-py3-none-any.whl (8.3 kB)
+Downloading fonttools-4.60.1-cp311-cp311-win_amd64.whl (2.3 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2.3/2.3 MB 25.8 MB/s  0:00:00
+Downloading fsspec-2025.10.0-py3-none-any.whl (200 kB)
+Downloading joblib-1.5.2-py3-none-any.whl (308 kB)
+Downloading kiwisolver-1.4.9-cp311-cp311-win_amd64.whl (73 kB)
+Downloading networkx-3.5-py3-none-any.whl (2.0 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2.0/2.0 MB 37.7 MB/s  0:00:00
+Downloading packaging-25.0-py3-none-any.whl (66 kB)
+Downloading pillow-12.0.0-cp311-cp311-win_amd64.whl (7.0 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 7.0/7.0 MB 28.8 MB/s  0:00:00
+Downloading pyparsing-3.2.5-py3-none-any.whl (113 kB)
+Using cached python_dateutil-2.9.0.post0-py2.py3-none-any.whl (229 kB)
+Using cached pytz-2025.2-py2.py3-none-any.whl (509 kB)
+Downloading scipy-1.16.3-cp311-cp311-win_amd64.whl (38.7 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 38.7/38.7 MB 26.5 MB/s  0:00:01
+Using cached six-1.17.0-py2.py3-none-any.whl (11 kB)
+Downloading sympy-1.14.0-py3-none-any.whl (6.3 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 6.3/6.3 MB 29.7 MB/s  0:00:00
+Using cached mpmath-1.3.0-py3-none-any.whl (536 kB)
+Downloading threadpoolctl-3.6.0-py3-none-any.whl (18 kB)
+Downloading typing_extensions-4.15.0-py3-none-any.whl (44 kB)
+Using cached tzdata-2025.2-py2.py3-none-any.whl (347 kB)
+Downloading filelock-3.20.0-py3-none-any.whl (16 kB)
+Downloading jinja2-3.1.6-py3-none-any.whl (134 kB)
+Downloading markupsafe-3.0.3-cp311-cp311-win_amd64.whl (15 kB)
+Installing collected packages: pytz, mpmath, tzdata, typing-extensions, threadpoolctl, sympy, six, pyparsing, pillow, packaging, numpy, networkx, MarkupSafe, kiwisolver, joblib, fsspec, fonttools, filelock, cycler, scipy, python-dateutil, jinja2, contourpy, torch, scikit-learn, pandas, matplotlib
+   ━━━━━━━━━━╺━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  7/27 [pyparsing]ERROR: Could not install packages due to an OSError: [Errno 28] No space left on device
+
+(venv) (base) PS C:\Users\aswin\Desktop\csai\regression> pip install numpy pandas scikit-learn matplotlib torch
+Collecting numpy
+  Using cached numpy-2.3.4-cp311-cp311-win_amd64.whl.metadata (60 kB)
+Collecting pandas
+  Using cached pandas-2.3.3-cp311-cp311-win_amd64.whl.metadata (19 kB)
+Collecting scikit-learn
+  Using cached scikit_learn-1.7.2-cp311-cp311-win_amd64.whl.metadata (11 kB)
+Collecting matplotlib
+  Using cached matplotlib-3.10.7-cp311-cp311-win_amd64.whl.metadata (11 kB)
+Collecting torch
+  Using cached torch-2.9.0-cp311-cp311-win_amd64.whl.metadata (30 kB)
+Collecting python-dateutil>=2.8.2 (from pandas)
+  Using cached python_dateutil-2.9.0.post0-py2.py3-none-any.whl.metadata (8.4 kB)
+Requirement already satisfied: pytz>=2020.1 in c:\users\aswin\desktop\csai\regression\venv\lib\site-packages (from pandas) (2025.2)
+Requirement already satisfied: tzdata>=2022.7 in c:\users\aswin\desktop\csai\regression\venv\lib\site-packages (from pandas) (2025.2)
+Collecting scipy>=1.8.0 (from scikit-learn)
+  Using cached scipy-1.16.3-cp311-cp311-win_amd64.whl.metadata (60 kB)
+Collecting joblib>=1.2.0 (from scikit-learn)
+  Using cached joblib-1.5.2-py3-none-any.whl.metadata (5.6 kB)
+Requirement already satisfied: threadpoolctl>=3.1.0 in c:\users\aswin\desktop\csai\regression\venv\lib\site-packages (from scikit-learn) (3.6.0)
+Collecting contourpy>=1.0.1 (from matplotlib)
+  Using cached contourpy-1.3.3-cp311-cp311-win_amd64.whl.metadata (5.5 kB)
+Collecting cycler>=0.10 (from matplotlib)
+  Using cached cycler-0.12.1-py3-none-any.whl.metadata (3.8 kB)
+Collecting fonttools>=4.22.0 (from matplotlib)
+  Using cached fonttools-4.60.1-cp311-cp311-win_amd64.whl.metadata (114 kB)
+Collecting kiwisolver>=1.3.1 (from matplotlib)
+  Using cached kiwisolver-1.4.9-cp311-cp311-win_amd64.whl.metadata (6.4 kB)
+Collecting packaging>=20.0 (from matplotlib)
+  Using cached packaging-25.0-py3-none-any.whl.metadata (3.3 kB)
+Collecting pillow>=8 (from matplotlib)
+  Using cached pillow-12.0.0-cp311-cp311-win_amd64.whl.metadata (9.0 kB)
+Requirement already satisfied: pyparsing>=3 in c:\users\aswin\desktop\csai\regression\venv\lib\site-packages (from matplotlib) (3.2.5)
+Collecting filelock (from torch)
+  Using cached filelock-3.20.0-py3-none-any.whl.metadata (2.1 kB)
+Requirement already satisfied: typing-extensions>=4.10.0 in c:\users\aswin\desktop\csai\regression\venv\lib\site-packages (from torch) (4.15.0)
+Requirement already satisfied: sympy>=1.13.3 in c:\users\aswin\desktop\csai\regression\venv\lib\site-packages (from torch) (1.14.0)
+Collecting networkx>=2.5.1 (from torch)
+  Using cached networkx-3.5-py3-none-any.whl.metadata (6.3 kB)
+Collecting jinja2 (from torch)
+  Using cached jinja2-3.1.6-py3-none-any.whl.metadata (2.9 kB)
+Collecting fsspec>=0.8.5 (from torch)
+  Using cached fsspec-2025.10.0-py3-none-any.whl.metadata (10 kB)
+Requirement already satisfied: six>=1.5 in c:\users\aswin\desktop\csai\regression\venv\lib\site-packages (from python-dateutil>=2.8.2->pandas) (1.17.0)
+Requirement already satisfied: mpmath<1.4,>=1.1.0 in c:\users\aswin\desktop\csai\regression\venv\lib\site-packages (from sympy>=1.13.3->torch) (1.3.0)
+Collecting MarkupSafe>=2.0 (from jinja2->torch)
+  Using cached markupsafe-3.0.3-cp311-cp311-win_amd64.whl.metadata (2.8 kB)
+Using cached numpy-2.3.4-cp311-cp311-win_amd64.whl (13.1 MB)
+Using cached pandas-2.3.3-cp311-cp311-win_amd64.whl (11.3 MB)
+Using cached scikit_learn-1.7.2-cp311-cp311-win_amd64.whl (8.9 MB)
+Using cached matplotlib-3.10.7-cp311-cp311-win_amd64.whl (8.1 MB)
+Using cached torch-2.9.0-cp311-cp311-win_amd64.whl (109.3 MB)
+Using cached contourpy-1.3.3-cp311-cp311-win_amd64.whl (225 kB)
+Using cached cycler-0.12.1-py3-none-any.whl (8.3 kB)
+Using cached fonttools-4.60.1-cp311-cp311-win_amd64.whl (2.3 MB)
+Using cached fsspec-2025.10.0-py3-none-any.whl (200 kB)
+Using cached joblib-1.5.2-py3-none-any.whl (308 kB)
+Using cached kiwisolver-1.4.9-cp311-cp311-win_amd64.whl (73 kB)
+Using cached networkx-3.5-py3-none-any.whl (2.0 MB)
+Using cached packaging-25.0-py3-none-any.whl (66 kB)
+Using cached pillow-12.0.0-cp311-cp311-win_amd64.whl (7.0 MB)
+Using cached python_dateutil-2.9.0.post0-py2.py3-none-any.whl (229 kB)
+Using cached scipy-1.16.3-cp311-cp311-win_amd64.whl (38.7 MB)
+Using cached filelock-3.20.0-py3-none-any.whl (16 kB)
+Using cached jinja2-3.1.6-py3-none-any.whl (134 kB)
+Using cached markupsafe-3.0.3-cp311-cp311-win_amd64.whl (15 kB)
+Installing collected packages: python-dateutil, pillow, packaging, numpy, networkx, MarkupSafe, kiwisolver, joblib, fsspec, fonttools, filelock, cycler, scipy, pandas, jinja2, contourpy, torch, scikit-learn, matplotlib
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╸━━━━━━ 16/19 [torch]ERROR: Could not install packages due to an OSError: [Errno 28] No space left on device
+
+(venv) (base) PS C:\Users\aswin\Desktop\csai\regression> pip install numpy pandas scikit-learn matplotlib torch
+Requirement already satisfied: numpy in c:\users\aswin\desktop\csai\regression\venv\lib\site-packages (2.3.4)
+Requirement already satisfied: pandas in c:\users\aswin\desktop\csai\regression\venv\lib\site-packages (2.3.3)
+Collecting scikit-learn
+  Using cached scikit_learn-1.7.2-cp311-cp311-win_amd64.whl.metadata (11 kB)
+Collecting matplotlib
+  Using cached matplotlib-3.10.7-cp311-cp311-win_amd64.whl.metadata (11 kB)
+Collecting torch
+  Using cached torch-2.9.0-cp311-cp311-win_amd64.whl.metadata (30 kB)
+Requirement already satisfied: python-dateutil>=2.8.2 in c:\users\aswin\desktop\csai\regression\venv\lib\site-packages (from pandas) (2.9.0.post0)
+Requirement already satisfied: pytz>=2020.1 in c:\users\aswin\desktop\csai\regression\venv\lib\site-packages (from pandas) (2025.2)
+Requirement already satisfied: tzdata>=2022.7 in c:\users\aswin\desktop\csai\regression\venv\lib\site-packages (from pandas) (2025.2)
+Requirement already satisfied: scipy>=1.8.0 in c:\users\aswin\desktop\csai\regression\venv\lib\site-packages (from scikit-learn) (1.16.3)
+Requirement already satisfied: joblib>=1.2.0 in c:\users\aswin\desktop\csai\regression\venv\lib\site-packages (from scikit-learn) (1.5.2)
+Requirement already satisfied: threadpoolctl>=3.1.0 in c:\users\aswin\desktop\csai\regression\venv\lib\site-packages (from scikit-learn) (3.6.0)
+Requirement already satisfied: contourpy>=1.0.1 in c:\users\aswin\desktop\csai\regression\venv\lib\site-packages (from matplotlib) (1.3.3)
+Requirement already satisfied: cycler>=0.10 in c:\users\aswin\desktop\csai\regression\venv\lib\site-packages (from matplotlib) (0.12.1)
+Requirement already satisfied: fonttools>=4.22.0 in c:\users\aswin\desktop\csai\regression\venv\lib\site-packages (from matplotlib) (4.60.1)
+Requirement already satisfied: kiwisolver>=1.3.1 in c:\users\aswin\desktop\csai\regression\venv\lib\site-packages (from matplotlib) (1.4.9)
+Requirement already satisfied: packaging>=20.0 in c:\users\aswin\desktop\csai\regression\venv\lib\site-packages (from matplotlib) (25.0)
+Requirement already satisfied: pillow>=8 in c:\users\aswin\desktop\csai\regression\venv\lib\site-packages (from matplotlib) (12.0.0)
+Requirement already satisfied: pyparsing>=3 in c:\users\aswin\desktop\csai\regression\venv\lib\site-packages (from matplotlib) (3.2.5)
+Requirement already satisfied: filelock in c:\users\aswin\desktop\csai\regression\venv\lib\site-packages (from torch) (3.20.0)
+Requirement already satisfied: typing-extensions>=4.10.0 in c:\users\aswin\desktop\csai\regression\venv\lib\site-packages (from torch) (4.15.0)
+Requirement already satisfied: sympy>=1.13.3 in c:\users\aswin\desktop\csai\regression\venv\lib\site-packages (from torch) (1.14.0)
+Requirement already satisfied: networkx>=2.5.1 in c:\users\aswin\desktop\csai\regression\venv\lib\site-packages (from torch) (3.5)
+Requirement already satisfied: jinja2 in c:\users\aswin\desktop\csai\regression\venv\lib\site-packages (from torch) (3.1.6)
+Requirement already satisfied: fsspec>=0.8.5 in c:\users\aswin\desktop\csai\regression\venv\lib\site-packages (from torch) (2025.10.0)
+Requirement already satisfied: six>=1.5 in c:\users\aswin\desktop\csai\regression\venv\lib\site-packages (from python-dateutil>=2.8.2->pandas) (1.17.0)
+Requirement already satisfied: mpmath<1.4,>=1.1.0 in c:\users\aswin\desktop\csai\regression\venv\lib\site-packages (from sympy>=1.13.3->torch) (1.3.0)
+Requirement already satisfied: MarkupSafe>=2.0 in c:\users\aswin\desktop\csai\regression\venv\lib\site-packages (from jinja2->torch) (3.0.3)
+Using cached scikit_learn-1.7.2-cp311-cp311-win_amd64.whl (8.9 MB)
+Using cached matplotlib-3.10.7-cp311-cp311-win_amd64.whl (8.1 MB)
+Using cached torch-2.9.0-cp311-cp311-win_amd64.whl (109.3 MB)
+Installing collected packages: torch, scikit-learn, matplotlib
+Successfully installed matplotlib-3.10.7 scikit-learn-1.7.2 torch-2.9.0
+(venv) (base) PS C:\Users\aswin\Desktop\csai\regression> C:\Users\aswin\Desktop\csai\regression\student_scores.csv
+C:\Users\aswin\Desktop\csai\regression\student_scores.csv : The term
+'C:\Users\aswin\Desktop\csai\regression\student_scores.csv' is not recognized as the name of a cmdlet, function,
+script file, or operable program. Check the spelling of the name, or if a path was included, verify that the path is
+correct and try again.
+At line:1 char:1
++ C:\Users\aswin\Desktop\csai\regression\student_scores.csv
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (C:\Users\aswin\...dent_scores.csv:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+
+(venv) (base) PS C:\Users\aswin\Desktop\csai\regression> nano student_scores.csv
+nano : The term 'nano' is not recognized as the name of a cmdlet, function, script file, or operable program. Check
+the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:1 char:1
++ nano student_scores.csv
++ ~~~~
+    + CategoryInfo          : ObjectNotFound: (nano:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+
+(venv) (base) PS C:\Users\aswin\Desktop\csai\regression> cat student_scores.csv
+cat : Cannot find path 'C:\Users\aswin\Desktop\csai\regression\student_scores.csv' because it does not exist.
+At line:1 char:1
++ cat student_scores.csv
++ ~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (C:\Users\aswin\...dent_scores.csv:String) [Get-Content], ItemNotFoundEx
+   ception
+    + FullyQualifiedErrorId : PathNotFound,Microsoft.PowerShell.Commands.GetContentCommand
+
+(venv) (base) PS C:\Users\aswin\Desktop\csai\regression> student_scores.csv
+student_scores.csv : The term 'student_scores.csv' is not recognized as the name of a cmdlet, function, script file,
+or operable program. Check the spelling of the name, or if a path was included, verify that the path is correct and
+try again.
+At line:1 char:1
++ student_scores.csv
++ ~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (student_scores.csv:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+
+(venv) (base) PS C:\Users\aswin\Desktop\csai\regression> gedit student_scores.csv
+gedit : The term 'gedit' is not recognized as the name of a cmdlet, function, script file, or operable program. Check
+the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:1 char:1
++ gedit student_scores.csv
++ ~~~~~
+    + CategoryInfo          : ObjectNotFound: (gedit:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+
+(venv) (base) PS C:\Users\aswin\Desktop\csai\regression> notepad student_scores.csv
+(venv) (base) PS C:\Users\aswin\Desktop\csai\regression> notepad student_scores.csv
+(venv) (base) PS C:\Users\aswin\Desktop\csai\regression> notepad student_scores.csv
+(venv) (base) PS C:\Users\aswin\Desktop\csai\regression> python train_from_csv.py --csv student_scores.csv --target score --epochs 50 --batch-size 8
+C:\Users\aswin\anaconda3\python.exe: can't open file 'C:\\Users\\aswin\\Desktop\\csai\\regression\\train_from_csv.py': [Errno 2] No such file or directory
+(venv) (base) PS C:\Users\aswin\Desktop\csai\regression> Cpython train_from_csv.py --csv student_scores.csv --target score --epochs 50 --batch-size 8
+Cpython : The term 'Cpython' is not recognized as the name of a cmdlet, function, script file, or operable program.
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:1 char:1
++ Cpython train_from_csv.py --csv student_scores.csv --target score --e ...
++ ~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (Cpython:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+
+(venv) (base) PS C:\Users\aswin\Desktop\csai\regression> Get-Process python -ErrorAction SilentlyContinue
+(venv) (base) PS C:\Users\aswin\Desktop\csai\regression> Get-ChildItem .\out_reg_csv\ -Force
+Get-ChildItem : Cannot find path 'C:\Users\aswin\Desktop\csai\regression\out_reg_csv\' because it does not exist.
+At line:1 char:1
++ Get-ChildItem .\out_reg_csv\ -Force
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (C:\Users\aswin\...on\out_reg_csv\:String) [Get-ChildItem], ItemNotFound
+   Exception
+    + FullyQualifiedErrorId : PathNotFound,Microsoft.PowerShell.Commands.GetChildItemCommand
+
+(venv) (base) PS C:\Users\aswin\Desktop\csai\regression> Get-Content .\out_reg_csv\training_history.csv -TotalCount 20
+Get-Content : Cannot find path 'C:\Users\aswin\Desktop\csai\regression\out_reg_csv\training_history.csv' because it
+does not exist.
+At line:1 char:1
++ Get-Content .\out_reg_csv\training_history.csv -TotalCount 20
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (C:\Users\aswin\...ing_history.csv:String) [Get-Content], ItemNotFoundEx
+   ception
+    + FullyQualifiedErrorId : PathNotFound,Microsoft.PowerShell.Commands.GetContentCommand
+
+(venv) (base) PS C:\Users\aswin\Desktop\csai\regression> @'
+>> study_hours,sleep_hours,attendance,score
+>> 1.5,8.0,70,45
+>> 2.0,7.5,76,50
+>> 2.5,6.5,78,53
+>> 3.0,7.0,82,60
+>> 3.5,6.5,85,62
+>> 4.0,6.0,88,66
+>> 4.5,6.5,90,68
+>> 5.0,6.0,92,72
+>> 5.5,5.5,94,75
+>> 6.0,6.0,96,78
+>> 6.5,5.5,97,82
+>> 7.0,5.0,98,85
+>> 7.5,5.0,99,87
+>> 8.0,5.0,99,89
+>> 8.5,4.5,100,91
+>> 9.0,4.5,100,94
+>> 9.5,4.0,100,96
+>> 10.0,4.0,100,98
+>> '@ | Out-File -Encoding utf8 student_scores.csv
+(venv) (base) PS C:\Users\aswin\Desktop\csai\regression> Get-ChildItem student_scores.csv
+
+
+    Directory: C:\Users\aswin\Desktop\csai\regression
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----        07-11-2025     00:11            302 student_scores.csv
+
+
+(venv) (base) PS C:\Users\aswin\Desktop\csai\regression> @'
+>> #!/usr/bin/env python3
+>> """
+>> train_from_csv.py
+>>
+>> Train a simple PyTorch linear regression model using an EXTERNAL CSV dataset.
+>>
+>> Usage examples:
+>>     python train_from_csv.py --csv student_scores.csv --target score --epochs 50 --batch-size 8
+>>
+>> Requirements:
+>>     pip install numpy pandas scikit-learn torch matplotlib
+>> """
+>> import os
+>> import time
+>> import argparse
+>> import numpy as np
+>> import pandas as pd
+>> import pickle
+>> from sklearn.preprocessing import StandardScaler
+>> from sklearn.model_selection import train_test_split
+>> from sklearn.metrics import mean_squared_error, r2_score
+>>
+>> import torch
+>> from torch import nn
+>> from torch.utils.data import TensorDataset, DataLoader
+>>
+>> class LinearRegressionTorch(nn.Module):
+>>     def __init__(self, n_features):
+>>         super().__init__()
+>>         self.linear = nn.Linear(n_features, 1)
+>>     def forward(self, x):
+>>         return self.linear(x).squeeze(1)
+>>
+>> def train_model(model, optimizer, criterion, dataloader, device, epochs=10, verbose=True):
+>>     model.train()
+>>     history = []
+>>     for epoch in range(1, epochs+1):
+>>         t0 = time.time()
+>>         running_loss = 0.0
+>>         batches = 0
+>>         for xb, yb in dataloader:
+>>             xb = xb.to(device)
+>>             yb = yb.to(device)
+>>             optimizer.zero_grad()
+>>             pred = model(xb)
+>>             loss = criterion(pred, yb)
+>>             loss.backward()
+>>             optimizer.step()
+>>             running_loss += loss.item()
+>>             batches += 1
+>>         epoch_time = time.time() - t0
+>>         avg_loss = running_loss / max(1, batches)
+>>         history.append({"epoch": epoch, "loss": avg_loss, "time_s": epoch_time})
+>>         if verbose:
+>>             print(f"Epoch {epoch:03d}: loss={avg_loss:.6f}  time={epoch_time:.3f}s")
+>>     return history
+>>
+>> def load_csv_dataset(csv_path, target_col=None):
+>>     if not os.path.exists(csv_path):
+>>         raise FileNotFoundError(f"CSV not found: {csv_path}")
+>>     df = pd.read_csv(csv_path)
+>>     if df.shape[0] == 0:
+>>         raise ValueError("CSV appears empty.")
+>>     if target_col is None:
+>>         if "y" in df.columns:
+>>             target_col = "y"
+>>         else:
+>>             target_col = df.columns[-1]
+>>             print(f"No target specified; using last column as target: '{target_col}'")
+>>     if target_col not in df.columns:
+>>         raise ValueError(f"Target column '{target_col}' not found in CSV columns: {list(df.columns)}")
+>>     X_df = df.drop(columns=[target_col]).copy()
+>>     y_ser = df[target_col].copy()
+>>     try:
+>>         X_num = X_df.apply(pd.to_numeric)
+>>         y_num = pd.to_numeric(y_ser)
+>>     except Exception as e:
+>>         raise ValueError("Failed to convert columns to numeric. Ensure all feature columns are numeric.") from e
+>>     X = X_num.values.astype(np.float32)
+>>     y = y_num.values.astype(np.float32)
+>>     feature_names = list(X_df.columns)
+>>     return X, y, feature_names
+>>
+>> def main():
+>>     parser = argparse.ArgumentParser(description="Train a PyTorch linear regression from an external CSV file.")
+>>     parser.add_argument("--csv", type=str, required=True, help="Path to input CSV file (must exist).")
+>>     parser.add_argument("--target", type=str, default=None, help="Name of target column. If omitted uses 'y' if present, otherwise last column.")
+>>     parser.add_argument("--out", type=str, default="out_reg_csv", help="Directory to save outputs.")
+>>     parser.add_argument("--test-size", type=float, default=0.2, help="Fraction of data reserved for test.")
+>>     parser.add_argument("--batch-size", type=int, default=1024, help="Training batch size.")
+>>     parser.add_argument("--epochs", type=int, default=20, help="Number of training epochs.")
+>>     parser.add_argument("--lr", type=float, default=0.01, help="Learning rate for SGD.")
+>>     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
+>>     args = parser.parse_args()
+>>
+>>     np.random.seed(args.seed)
+>>     torch.manual_seed(args.seed)
+>>
+>>     os.makedirs(args.out, exist_ok=True)
+>>
+>>     print("Loading CSV dataset...")
+>>     X, y, feature_names = load_csv_dataset(args.csv, target_col=args.target)
+>>     n_samples, n_features = X.shape
+>>     print(f"Loaded dataset with {n_samples} samples and {n_features} features.")
+>>     print("Feature columns:", feature_names)
+>>
+>>     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=args.test_size, random_state=args.seed, shuffle=True)
+>>     print(f"Train samples: {len(X_train)}, Test samples: {len(X_test)}")
+>>
+>>     scaler = StandardScaler()
+>>     X_train_scaled = scaler.fit_transform(X_train)
+>>     X_test_scaled = scaler.transform(X_test)
+>>
+>>     scaler_path = os.path.join(args.out, "scaler.pkl")
+>>     with open(scaler_path, "wb") as f:
+>>         pickle.dump(scaler, f)
+>>     print("Saved scaler to:", scaler_path)
+>>
+>>     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+>>     print("Using device:", device)
+>>
+>>     train_ds = TensorDataset(torch.from_numpy(X_train_scaled.astype(np.float32)), torch.from_numpy(y_train.astype(np.float32)))
+>>     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=False)
+>>
+>>     model = LinearRegressionTorch(n_features=n_features).to(device)
+>>     optimizer = torch.optim.SGD(model.parameters(), lr=args.lr)
+>>     criterion = nn.MSELoss()
+>>
+>>     print("\nStarting training...")
+>>     history = train_model(model, optimizer, criterion, train_loader, device, epochs=args.epochs, verbose=True)
+>>
+>>     model_path = os.path.join(args.out, "torch_linear_model.pth")
+>>     torch.save(model.state_dict(), model_path)
+>>     print("Saved model state to:", model_path)
+>>
+>>     model.eval()
+>>     with torch.no_grad():
+>>         X_test_t = torch.from_numpy(X_test_scaled.astype(np.float32)).to(device)
+>>         y_pred_t = model(X_test_t).cpu().numpy()
+>>     mse = mean_squared_error(y_test, y_pred_t)
+>>     rmse = np.sqrt(mse)
+>>     r2 = r2_score(y_test, y_pred_t)
+>>
+>>     print("\n=== Final evaluation on test set ===")
+>>     print(f"MSE  : {mse:.6f}")
+>>     print(f"RMSE : {rmse:.6f}")
+>>     print(f"R^2  : {r2:.6f}")
+>>
+>>     nsave = min(5000, len(y_test))
+>>     preds_df = pd.DataFrame(X_test[:nsave], columns=feature_names)
+>>     preds_df["y_true"] = y_test[:nsave]
+>>     preds_df["y_pred"] = y_pred_t[:nsave]
+>>     preds_csv = os.path.join(args.out, "predictions_preview.csv")
+>>     preds_df.to_csv(preds_csv, index=False)
+>>     print("Saved prediction preview to:", preds_csv)
+>>
+>>     hist_df = pd.DataFrame(history)
+>>     hist_csv = os.path.join(args.out, "training_history.csv")
+>>     hist_df.to_csv(hist_csv, index=False)
+>>     print("Saved training history (epoch loss/time) to:", hist_csv)
+>>
+>>     print("\nSample predictions (first 10 rows of preview):")
+>>     for i in range(min(10, len(preds_df))):
+>>         row = preds_df.iloc[i]
+>>         feats = ", ".join([f"{c}={row[c]:.3f}" for c in feature_names])
+>>         print(f"row {i}: {feats}  | true={row['y_true']:.3f}  pred={row['y_pred']:.3f}")
+>>
+>>     print("\nArtifacts saved in:", args.out)
+>>     print(" - model state:", model_path)
+>>     print(" - scaler:", scaler_path)
+>>     print(" - predictions preview:", preds_csv)
+>>     print(" - training history:", hist_csv)
+>>
+>> if __name__ == "__main__":
+>>     main()
+>> '@ | Out-File -Encoding utf8 train_from_csv.py
+(venv) (base) PS C:\Users\aswin\Desktop\csai\regression> Get-ChildItem train_from_csv.py
+
+
+    Directory: C:\Users\aswin\Desktop\csai\regression
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a----        07-11-2025     00:11           6997 train_from_csv.py
+
+
+(venv) (base) PS C:\Users\aswin\Desktop\csai\regression> .\venv\Scripts\python.exe train_from_csv.py --csv student_scores.csv --target score --epochs 50 --batch-size 8
+Loading CSV dataset...
+Loaded dataset with 18 samples and 3 features.
+Feature columns: ['study_hours', 'sleep_hours', 'attendance']
+Train samples: 14, Test samples: 4
+Saved scaler to: out_reg_csv\scaler.pkl
+Using device: cpu
+
+Starting training...
+Epoch 001: loss=6264.551270  time=0.006s
+Epoch 002: loss=5825.058838  time=0.003s
+Epoch 003: loss=5379.602051  time=0.002s
+Epoch 004: loss=4881.987549  time=0.002s
+Epoch 005: loss=4503.628418  time=0.001s
+Epoch 006: loss=4137.738403  time=0.004s
+Epoch 007: loss=3837.786377  time=0.001s
+Epoch 008: loss=3532.414673  time=0.002s
+Epoch 009: loss=3301.368652  time=0.002s
+Epoch 010: loss=2995.698730  time=0.002s
+Epoch 011: loss=2778.140869  time=0.003s
+Epoch 012: loss=2581.807495  time=0.002s
+Epoch 013: loss=2341.320923  time=0.003s
+Epoch 014: loss=2179.530151  time=0.004s
+Epoch 015: loss=1981.674805  time=0.002s
+Epoch 016: loss=1835.108826  time=0.002s
+Epoch 017: loss=1727.142639  time=0.006s
+Epoch 018: loss=1560.080383  time=0.004s
+Epoch 019: loss=1433.957947  time=0.002s
+Epoch 020: loss=1318.007568  time=0.003s
+Epoch 021: loss=1218.402832  time=0.002s
+Epoch 022: loss=1127.733459  time=0.001s
+Epoch 023: loss=1040.545471  time=0.003s
+Epoch 024: loss=958.535767  time=0.002s
+Epoch 025: loss=883.138641  time=0.004s
+Epoch 026: loss=819.567444  time=0.002s
+Epoch 027: loss=760.329895  time=0.003s
+Epoch 028: loss=690.318634  time=0.003s
+Epoch 029: loss=643.988373  time=0.001s
+Epoch 030: loss=594.516907  time=0.001s
+Epoch 031: loss=546.550781  time=0.002s
+Epoch 032: loss=511.957291  time=0.002s
+Epoch 033: loss=460.868973  time=0.005s
+Epoch 034: loss=429.385284  time=0.002s
+Epoch 035: loss=395.432281  time=0.001s
+Epoch 036: loss=364.998291  time=0.001s
+Epoch 037: loss=335.405090  time=0.001s
+Epoch 038: loss=308.677307  time=0.001s
+Epoch 039: loss=284.612579  time=0.001s
+Epoch 040: loss=264.030380  time=0.002s
+Epoch 041: loss=243.951843  time=0.002s
+Epoch 042: loss=221.474739  time=0.003s
+Epoch 043: loss=208.716301  time=0.001s
+Epoch 044: loss=192.156067  time=0.002s
+Epoch 045: loss=177.596588  time=0.001s
+Epoch 046: loss=162.696228  time=0.001s
+Epoch 047: loss=150.290909  time=0.001s
+Epoch 048: loss=138.863464  time=0.001s
+Epoch 049: loss=127.635044  time=0.002s
+Epoch 050: loss=118.572842  time=0.003s
+Saved model state to: out_reg_csv\torch_linear_model.pth
+
+=== Final evaluation on test set ===
+MSE  : 111.702957
+RMSE : 10.568962
+R^2  : 0.232282
+Saved prediction preview to: out_reg_csv\predictions_preview.csv
+Saved training history (epoch loss/time) to: out_reg_csv\training_history.csv
+
+Sample predictions (first 10 rows of preview):
+row 0: study_hours=1.500, sleep_hours=8.000, attendance=70.000  | true=45.000  pred=31.659
+row 1: study_hours=2.000, sleep_hours=7.500, attendance=76.000  | true=50.000  pred=38.785
+row 2: study_hours=5.500, sleep_hours=5.500, attendance=94.000  | true=75.000  pred=66.727
+row 3: study_hours=4.000, sleep_hours=6.000, attendance=88.000  | true=66.000  pred=57.363
+
+Artifacts saved in: out_reg_csv
+ - model state: out_reg_csv\torch_linear_model.pth
+ - scaler: out_reg_csv\scaler.pkl
+ - predictions preview: out_reg_csv\predictions_preview.csv
+ - training history: out_reg_csv\training_history.csv
+(venv) (base) PS C:\Users\aswin\Desktop\csai\regression> Get-ChildItem .\out_reg_csv\ | Format-Table Name,Length
+
+Name                    Length
+----                    ------
+predictions_preview.csv    164
+scaler.pkl                 522
+torch_linear_model.pth    2045
+training_history.csv      2205
+
+
+(venv) (base) PS C:\Users\aswin\Desktop\csai\regression> Get-Content .\out_reg_csv\training_history.csv -TotalCount 50
+epoch,loss,time_s
+1,6264.55126953125,0.0059511661529541016
+2,5825.058837890625,0.002527952194213867
+3,5379.60205078125,0.0020592212677001953
+4,4881.987548828125,0.0018892288208007812
+5,4503.62841796875,0.0010013580322265625
+6,4137.7384033203125,0.0036520957946777344
+7,3837.786376953125,0.0008914470672607422
+8,3532.4146728515625,0.0020074844360351562
+9,3301.36865234375,0.0020923614501953125
+10,2995.69873046875,0.0024170875549316406
+11,2778.140869140625,0.0030117034912109375
+12,2581.8074951171875,0.0020020008087158203
+13,2341.3209228515625,0.0031075477600097656
+14,2179.5301513671875,0.003525972366333008
+15,1981.6748046875,0.0020127296447753906
+16,1835.1088256835938,0.0019943714141845703
+17,1727.1426391601562,0.0058748722076416016
+18,1560.0803833007812,0.003865957260131836
+19,1433.9579467773438,0.002001523971557617
+20,1318.007568359375,0.0025064945220947266
+21,1218.40283203125,0.002118349075317383
+22,1127.7334594726562,0.0008924007415771484
+23,1040.5454711914062,0.0030057430267333984
+24,958.5357666015625,0.002094268798828125
+25,883.1386413574219,0.0036242008209228516
+26,819.5674438476562,0.0020003318786621094
+27,760.3298950195312,0.003092527389526367
+28,690.3186340332031,0.002537965774536133
+29,643.9883728027344,0.000993967056274414
+30,594.5169067382812,0.0008871555328369141
+31,546.55078125,0.0019731521606445312
+32,511.95729064941406,0.0018994808197021484
+33,460.8689727783203,0.004563331604003906
+34,429.3852844238281,0.002109527587890625
+35,395.4322814941406,0.0009005069732666016
+36,364.998291015625,0.0010955333709716797
+37,335.40509033203125,0.0010116100311279297
+38,308.67730712890625,0.0011131763458251953
+39,284.6125793457031,0.0009899139404296875
+40,264.03038024902344,0.0019073486328125
+41,243.95184326171875,0.002022266387939453
+42,221.47473907470703,0.0025217533111572266
+43,208.71630096435547,0.0011057853698730469
+44,192.15606689453125,0.001888275146484375
+45,177.59658813476562,0.0009915828704833984
+46,162.69622802734375,0.0009949207305908203
+47,150.29090881347656,0.0010745525360107422
+48,138.86346435546875,0.0005054473876953125
+49,127.63504409790039,0.0020079612731933594
+(venv) (base) PS C:\Users\aswin\Desktop\csai\regression> Get-Content .\out_reg_csv\predictions_preview.csv -TotalCount 50
+study_hours,sleep_hours,attendance,y_true,y_pred
+1.5,8.0,70.0,45.0,31.658619
+2.0,7.5,76.0,50.0,38.78535
+5.5,5.5,94.0,75.0,66.72653
+4.0,6.0,88.0,66.0,57.362827
+(venv) (base) PS C:\Users\aswin\Desktop\csai\regression> Start-Process notepad.exe .\out_reg_csv\training_history.csv
+(venv) (base) PS C:\Users\aswin\Desktop\csai\regression> Start-Process notepad.exe .\out_reg_csv\predictions_preview.csv
+
+(venv) (base) PS C:\Users\aswin\Desktop\csai\regression> @'
+>> import pandas as pd
+>> import matplotlib.pyplot as plt
+>>
+>> # Load training history
+>> hist = pd.read_csv("out_reg_csv/training_history.csv")
+>> plt.figure(figsize=(6,4))
+>> plt.plot(hist["epoch"], hist["loss"], marker="o")
+>> plt.xlabel("Epoch")
+>> plt.ylabel("Loss (MSE)")
+>> plt.title("Training loss vs epoch")
+>> plt.grid(True)
+>> plt.tight_layout()
+>> plt.savefig("out_reg_csv/loss_vs_epoch.png", dpi=150)
+>> print("Saved out_reg_csv/loss_vs_epoch.png")
+>>
+>> # Load predictions
+>> preds = pd.read_csv("out_reg_csv/predictions_preview.csv")
+>> if {"y_true","y_pred"}.issubset(preds.columns):
+>>     plt.figure(figsize=(6,6))
+>>     plt.scatter(preds["y_true"], preds["y_pred"], alpha=0.7)
+>>     plt.plot([preds["y_true"].min(), preds["y_true"].max()],
+>>              [preds["y_true"].min(), preds["y_true"].max()], linestyle="--")
+>>     plt.xlabel("True score")
+>>     plt.ylabel("Predicted score")
+>>     plt.title("True vs Predicted (test preview)")
+>>     plt.grid(True)
+>>     plt.tight_layout()
+>>     plt.savefig("out_reg_csv/true_vs_pred.png", dpi=150)
+>>     print("Saved out_reg_csv/true_vs_pred.png")
+>> else:
+>>     print("Cannot plot true vs pred: columns y_true/y_pred missing in predictions_preview.csv")
+>>
+>> print("Done.")
+>> '@ | Out-File -Encoding utf8 plot_results.py
+(venv) (base) PS C:\Users\aswin\Desktop\csai\regression> .\venv\Scripts\python.exe plot_results.py
+Saved out_reg_csv/loss_vs_epoch.png
+Saved out_reg_csv/true_vs_pred.png
+Done.
+(venv) (base) PS C:\Users\aswin\Desktop\csai\regression> Start-Process out_reg_csv\loss_vs_epoch.png
+(venv) (base) PS C:\Users\aswin\Desktop\csai\regression> Start-Process out_reg_csv\true_vs_pred.png
+(venv) (base) PS C:\Users\aswin\Desktop\csai\regression> @'
+>> import pandas as pd
+>> import numpy as np
+>>
+>> # Parameters
+>> n_samples = 10000   # number of rows
+>> n_features = 5      # number of input columns
+>> np.random.seed(42)
+>>
+>> # Generate synthetic linear data
+>> X = np.random.rand(n_samples, n_features) * 100
+>> true_weights = np.array([4.5, -2.2, 3.8, 1.2, 0.9])
+>> noise = np.random.randn(n_samples) * 5
+>> y = X.dot(true_weights) + 20 + noise  # linear relation + noise
+>>
+>> cols = [f"feature_{i+1}" for i in range(n_features)]
+>> df = pd.DataFrame(X, columns=cols)
+>> df["target"] = y
+>>
+>> df.to_csv("big_dataset.csv", index=False)
+>> print(f"Saved big_dataset.csv with {n_samples} rows and {n_features} features.")
+>> '@ | Out-File -Encoding utf8 make_big_dataset.py
+(venv) (base) PS C:\Users\aswin\Desktop\csai\regression> .\venv\Scripts\python.exe make_big_dataset.py
+Saved big_dataset.csv with 10000 rows and 5 features.
+(venv) (base) PS C:\Users\aswin\Desktop\csai\regression> .\venv\Scripts\python.exe train_from_csv.py --csv big_dataset.csv --target target --epochs 300 --batch-size 512
+Loading CSV dataset...
+Loaded dataset with 10000 samples and 5 features.
+Feature columns: ['feature_1', 'feature_2', 'feature_3', 'feature_4', 'feature_5']
+Train samples: 8000, Test samples: 2000
+Saved scaler to: out_reg_csv\scaler.pkl
+Using device: cpu
+
+Starting training...
+Epoch 001: loss=166600.948730  time=0.055s
+Epoch 002: loss=87244.892334  time=0.049s
+Epoch 003: loss=45790.610840  time=0.052s
+Epoch 004: loss=23966.191895  time=0.061s
+Epoch 005: loss=12548.633667  time=0.060s
+Epoch 006: loss=6597.905060  time=0.080s
+Epoch 007: loss=3465.712051  time=0.204s
+Epoch 008: loss=1829.325005  time=0.085s
+Epoch 009: loss=969.113037  time=0.069s
+Epoch 010: loss=518.921137  time=0.055s
+Epoch 011: loss=284.179700  time=0.050s
+Epoch 012: loss=160.532071  time=0.052s
+Epoch 013: loss=95.917558  time=0.060s
+Epoch 014: loss=62.238126  time=0.066s
+Epoch 015: loss=44.529919  time=0.055s
+Epoch 016: loss=35.148510  time=0.092s
+Epoch 017: loss=30.437962  time=0.110s
+Epoch 018: loss=27.794572  time=0.102s
+Epoch 019: loss=26.541285  time=0.055s
+Epoch 020: loss=25.801931  time=0.070s
+Epoch 021: loss=25.377846  time=0.071s
+Epoch 022: loss=25.268822  time=0.085s
+Epoch 023: loss=25.122289  time=0.059s
+Epoch 024: loss=25.083768  time=0.066s
+Epoch 025: loss=25.002509  time=0.068s
+Epoch 026: loss=25.054968  time=0.077s
+Epoch 027: loss=25.001900  time=0.072s
+Epoch 028: loss=25.036026  time=0.062s
+Epoch 029: loss=24.935949  time=0.075s
+Epoch 030: loss=24.979057  time=0.054s
+Epoch 031: loss=25.058658  time=0.046s
+Epoch 032: loss=24.996930  time=0.086s
+Epoch 033: loss=25.030542  time=0.192s
+Epoch 034: loss=25.004902  time=0.195s
+Epoch 035: loss=25.018354  time=0.390s
+Epoch 036: loss=24.998981  time=0.224s
+Epoch 037: loss=24.980511  time=0.195s
+Epoch 038: loss=25.049482  time=0.199s
+Epoch 039: loss=25.067556  time=0.211s
+Epoch 040: loss=25.013250  time=0.289s
+Epoch 041: loss=25.055936  time=0.261s
+Epoch 042: loss=25.043343  time=0.221s
+Epoch 043: loss=25.008409  time=0.218s
+Epoch 044: loss=25.011164  time=0.217s
+Epoch 045: loss=24.967335  time=0.218s
+Epoch 046: loss=25.037836  time=0.224s
+Epoch 047: loss=25.053937  time=0.193s
+Epoch 048: loss=24.982830  time=0.193s
+Epoch 049: loss=24.974759  time=0.193s
+Epoch 050: loss=25.079847  time=0.181s
+Epoch 051: loss=25.021683  time=0.175s
+Epoch 052: loss=25.001930  time=0.177s
+Epoch 053: loss=25.017073  time=0.173s
+Epoch 054: loss=24.999791  time=0.188s
+Epoch 055: loss=25.055199  time=0.188s
+Epoch 056: loss=24.978449  time=0.191s
+Epoch 057: loss=25.008870  time=0.194s
+Epoch 058: loss=25.037840  time=0.193s
+Epoch 059: loss=24.977012  time=0.188s
+Epoch 060: loss=25.021175  time=0.189s
+Epoch 061: loss=25.016283  time=0.188s
+Epoch 062: loss=25.047941  time=0.186s
+Epoch 063: loss=25.089636  time=0.187s
+Epoch 064: loss=25.013739  time=0.360s
+Epoch 065: loss=25.030730  time=0.075s
+Epoch 066: loss=25.150100  time=0.054s
+Epoch 067: loss=25.014065  time=0.058s
+Epoch 068: loss=25.052761  time=0.075s
+Epoch 069: loss=25.038244  time=0.088s
+Epoch 070: loss=24.983241  time=0.106s
+Epoch 071: loss=25.095400  time=0.104s
+Epoch 072: loss=24.931312  time=0.084s
+Epoch 073: loss=24.970907  time=0.077s
+Epoch 074: loss=25.017709  time=0.076s
+Epoch 075: loss=25.016695  time=0.067s
+Epoch 076: loss=24.950498  time=0.072s
+Epoch 077: loss=24.940047  time=0.086s
+Epoch 078: loss=25.094018  time=0.079s
+Epoch 079: loss=25.128158  time=0.066s
+Epoch 080: loss=25.074722  time=0.057s
+Epoch 081: loss=25.077525  time=0.056s
+Epoch 082: loss=25.010295  time=0.070s
+Epoch 083: loss=25.022950  time=0.050s
+Epoch 084: loss=25.033367  time=0.048s
+Epoch 085: loss=24.973120  time=0.056s
+Epoch 086: loss=24.961777  time=0.055s
+Epoch 087: loss=25.005139  time=0.050s
+Epoch 088: loss=25.112812  time=0.062s
+Epoch 089: loss=25.070201  time=0.071s
+Epoch 090: loss=25.085142  time=0.051s
+Epoch 091: loss=25.113417  time=0.069s
+Epoch 092: loss=24.998577  time=0.180s
+Epoch 093: loss=25.026254  time=0.098s
+Epoch 094: loss=25.013433  time=0.079s
+Epoch 095: loss=24.963975  time=0.098s
+Epoch 096: loss=24.989493  time=0.085s
+Epoch 097: loss=24.935711  time=0.048s
+Epoch 098: loss=25.013089  time=0.056s
+Epoch 099: loss=24.980262  time=0.105s
+Epoch 100: loss=25.114139  time=0.097s
+Epoch 101: loss=25.097139  time=0.053s
+Epoch 102: loss=25.011510  time=0.080s
+Epoch 103: loss=25.061613  time=0.063s
+Epoch 104: loss=25.002576  time=0.066s
+Epoch 105: loss=24.984591  time=0.061s
+Epoch 106: loss=25.018780  time=0.061s
+Epoch 107: loss=24.984140  time=0.062s
+Epoch 108: loss=24.995359  time=0.057s
+Epoch 109: loss=25.106390  time=0.048s
+Epoch 110: loss=25.053247  time=0.048s
+Epoch 111: loss=24.940346  time=0.059s
+Epoch 112: loss=25.048908  time=0.063s
+Epoch 113: loss=25.092476  time=0.060s
+Epoch 114: loss=24.996903  time=0.050s
+Epoch 115: loss=25.032207  time=0.062s
+Epoch 116: loss=25.073971  time=0.064s
+Epoch 117: loss=24.997270  time=0.060s
+Epoch 118: loss=24.995984  time=0.049s
+Epoch 119: loss=25.007816  time=0.061s
+Epoch 120: loss=25.040668  time=0.202s
+Epoch 121: loss=25.014153  time=0.075s
+Epoch 122: loss=24.973767  time=0.087s
+Epoch 123: loss=25.081622  time=0.075s
+Epoch 124: loss=25.078440  time=0.073s
+Epoch 125: loss=24.973447  time=0.057s
+Epoch 126: loss=25.017341  time=0.052s
+Epoch 127: loss=24.972239  time=0.098s
+Epoch 128: loss=24.975557  time=0.095s
+Epoch 129: loss=25.004727  time=0.072s
+Epoch 130: loss=25.061649  time=0.073s
+Epoch 131: loss=25.076346  time=0.077s
+Epoch 132: loss=25.048013  time=0.051s
+Epoch 133: loss=25.056134  time=0.063s
+Epoch 134: loss=24.924180  time=0.059s
+Epoch 135: loss=25.095359  time=0.050s
+Epoch 136: loss=24.946359  time=0.060s
+Epoch 137: loss=25.030261  time=0.047s
+Epoch 138: loss=25.120674  time=0.076s
+Epoch 139: loss=25.025865  time=0.072s
+Epoch 140: loss=25.066414  time=0.062s
+Epoch 141: loss=24.969918  time=0.062s
+Epoch 142: loss=24.998575  time=0.065s
+Epoch 143: loss=25.057835  time=0.058s
+Epoch 144: loss=25.126127  time=0.050s
+Epoch 145: loss=25.027866  time=0.049s
+Epoch 146: loss=25.115593  time=0.067s
+Epoch 147: loss=25.050539  time=0.060s
+Epoch 148: loss=25.104175  time=0.195s
+Epoch 149: loss=24.987947  time=0.156s
+Epoch 150: loss=25.026806  time=0.065s
+Epoch 151: loss=25.007887  time=0.051s
+Epoch 152: loss=24.983983  time=0.049s
+Epoch 153: loss=25.055963  time=0.091s
+Epoch 154: loss=25.039271  time=0.051s
+Epoch 155: loss=24.999774  time=0.069s
+Epoch 156: loss=24.970256  time=0.051s
+Epoch 157: loss=25.007426  time=0.047s
+Epoch 158: loss=24.968745  time=0.086s
+Epoch 159: loss=25.065066  time=0.068s
+Epoch 160: loss=25.009341  time=0.062s
+Epoch 161: loss=25.074470  time=0.065s
+Epoch 162: loss=25.002754  time=0.069s
+Epoch 163: loss=24.976680  time=0.074s
+Epoch 164: loss=25.110343  time=0.047s
+Epoch 165: loss=25.013847  time=0.045s
+Epoch 166: loss=25.006276  time=0.048s
+Epoch 167: loss=25.095728  time=0.047s
+Epoch 168: loss=25.094730  time=0.067s
+Epoch 169: loss=25.053260  time=0.081s
+Epoch 170: loss=25.049490  time=0.058s
+Epoch 171: loss=24.991163  time=0.059s
+Epoch 172: loss=25.079476  time=0.057s
+Epoch 173: loss=25.020281  time=0.061s
+Epoch 174: loss=24.975178  time=0.074s
+Epoch 175: loss=24.946762  time=0.081s
+Epoch 176: loss=25.065875  time=0.173s
+Epoch 177: loss=24.992021  time=0.090s
+Epoch 178: loss=24.979760  time=0.064s
+Epoch 179: loss=25.082027  time=0.085s
+Epoch 180: loss=25.103221  time=0.075s
+Epoch 181: loss=25.012891  time=0.055s
+Epoch 182: loss=25.102973  time=0.061s
+Epoch 183: loss=25.093763  time=0.091s
+Epoch 184: loss=25.023557  time=0.089s
+Epoch 185: loss=25.091284  time=0.101s
+Epoch 186: loss=24.970723  time=0.097s
+Epoch 187: loss=25.013099  time=0.075s
+Epoch 188: loss=24.981287  time=0.076s
+Epoch 189: loss=25.047282  time=0.064s
+Epoch 190: loss=24.984208  time=0.063s
+Epoch 191: loss=25.020982  time=0.072s
+Epoch 192: loss=25.051990  time=0.082s
+Epoch 193: loss=25.000244  time=0.078s
+Epoch 194: loss=25.011469  time=0.057s
+Epoch 195: loss=25.021351  time=0.051s
+Epoch 196: loss=25.065991  time=0.082s
+Epoch 197: loss=25.026837  time=0.056s
+Epoch 198: loss=25.059673  time=0.066s
+Epoch 199: loss=25.014965  time=0.053s
+Epoch 200: loss=25.119205  time=0.046s
+Epoch 201: loss=25.050585  time=0.052s
+Epoch 202: loss=25.018720  time=0.061s
+Epoch 203: loss=24.981099  time=0.047s
+Epoch 204: loss=25.018906  time=0.051s
+Epoch 205: loss=25.037514  time=0.213s
+Epoch 206: loss=25.112047  time=0.070s
+Epoch 207: loss=25.001887  time=0.083s
+Epoch 208: loss=25.032717  time=0.070s
+Epoch 209: loss=25.023724  time=0.056s
+Epoch 210: loss=25.090657  time=0.063s
+Epoch 211: loss=25.066179  time=0.066s
+Epoch 212: loss=24.987339  time=0.052s
+Epoch 213: loss=25.062849  time=0.074s
+Epoch 214: loss=25.137098  time=0.078s
+Epoch 215: loss=25.006110  time=0.046s
+Epoch 216: loss=24.965881  time=0.060s
+Epoch 217: loss=24.997805  time=0.047s
+Epoch 218: loss=24.983459  time=0.047s
+Epoch 219: loss=25.146176  time=0.052s
+Epoch 220: loss=25.048245  time=0.071s
+Epoch 221: loss=25.181830  time=0.064s
+Epoch 222: loss=25.018448  time=0.063s
+Epoch 223: loss=25.023022  time=0.061s
+Epoch 224: loss=24.994955  time=0.068s
+Epoch 225: loss=24.980615  time=0.080s
+Epoch 226: loss=25.112773  time=0.074s
+Epoch 227: loss=25.128083  time=0.081s
+Epoch 228: loss=25.091601  time=0.089s
+Epoch 229: loss=24.954803  time=0.061s
+Epoch 230: loss=25.088434  time=0.050s
+Epoch 231: loss=25.042329  time=0.050s
+Epoch 232: loss=25.037113  time=0.060s
+Epoch 233: loss=25.021940  time=0.192s
+Epoch 234: loss=25.113632  time=0.046s
+Epoch 235: loss=24.981636  time=0.069s
+Epoch 236: loss=25.062572  time=0.107s
+Epoch 237: loss=24.972070  time=0.071s
+Epoch 238: loss=24.952940  time=0.075s
+Epoch 239: loss=25.039909  time=0.090s
+Epoch 240: loss=25.099462  time=0.059s
+Epoch 241: loss=24.979746  time=0.069s
+Epoch 242: loss=25.034493  time=0.110s
+Epoch 243: loss=25.005474  time=0.130s
+Epoch 244: loss=24.995957  time=0.112s
+Epoch 245: loss=25.081889  time=0.081s
+Epoch 246: loss=25.043123  time=0.064s
+Epoch 247: loss=24.939953  time=0.055s
+Epoch 248: loss=24.989509  time=0.075s
+Epoch 249: loss=25.091332  time=0.070s
+Epoch 250: loss=25.112038  time=0.052s
+Epoch 251: loss=25.054325  time=0.068s
+Epoch 252: loss=25.059014  time=0.062s
+Epoch 253: loss=25.039115  time=0.086s
+Epoch 254: loss=24.967141  time=0.052s
+Epoch 255: loss=24.977874  time=0.063s
+Epoch 256: loss=24.987758  time=0.075s
+Epoch 257: loss=25.071962  time=0.071s
+Epoch 258: loss=25.008455  time=0.068s
+Epoch 259: loss=25.018107  time=0.070s
+Epoch 260: loss=24.997373  time=0.200s
+Epoch 261: loss=25.026558  time=0.083s
+Epoch 262: loss=25.065388  time=0.050s
+Epoch 263: loss=24.949057  time=0.075s
+Epoch 264: loss=24.971371  time=0.054s
+Epoch 265: loss=25.022330  time=0.068s
+Epoch 266: loss=24.966694  time=0.076s
+Epoch 267: loss=25.030063  time=0.064s
+Epoch 268: loss=25.095107  time=0.066s
+Epoch 269: loss=25.026586  time=0.059s
+Epoch 270: loss=25.036526  time=0.053s
+Epoch 271: loss=25.026538  time=0.075s
+Epoch 272: loss=25.035685  time=0.066s
+Epoch 273: loss=25.041802  time=0.065s
+Epoch 274: loss=25.118197  time=0.061s
+Epoch 275: loss=25.020419  time=0.070s
+Epoch 276: loss=24.991643  time=0.065s
+Epoch 277: loss=24.937424  time=0.051s
+Epoch 278: loss=25.000852  time=0.069s
+Epoch 279: loss=24.974224  time=0.091s
+Epoch 280: loss=25.013458  time=0.071s
+Epoch 281: loss=25.086043  time=0.070s
+Epoch 282: loss=24.967287  time=0.054s
+Epoch 283: loss=25.042045  time=0.055s
+Epoch 284: loss=25.030025  time=0.070s
+Epoch 285: loss=25.125891  time=0.068s
+Epoch 286: loss=24.976426  time=0.052s
+Epoch 287: loss=25.051025  time=0.092s
+Epoch 288: loss=25.187517  time=0.070s
+Epoch 289: loss=24.958515  time=0.174s
+Epoch 290: loss=25.017870  time=0.070s
+Epoch 291: loss=24.994529  time=0.052s
+Epoch 292: loss=25.064695  time=0.067s
+Epoch 293: loss=25.030834  time=0.061s
+Epoch 294: loss=25.051047  time=0.062s
+Epoch 295: loss=25.051603  time=0.053s
+Epoch 296: loss=25.053344  time=0.052s
+Epoch 297: loss=25.001595  time=0.054s
+Epoch 298: loss=25.005678  time=0.055s
+Epoch 299: loss=25.039269  time=0.051s
+Epoch 300: loss=24.985858  time=0.074s
+Saved model state to: out_reg_csv\torch_linear_model.pth
+
+=== Final evaluation on test set ===
+MSE  : 25.046013
+RMSE : 5.004599
+R^2  : 0.999252
+Saved prediction preview to: out_reg_csv\predictions_preview.csv
+Saved training history (epoch loss/time) to: out_reg_csv\training_history.csv
+
+Sample predictions (first 10 rows of preview):
+row 0: feature_1=13.679, feature_2=66.580, feature_3=69.259, feature_4=67.697, feature_5=55.214  | true=327.743  pred=329.174
+row 1: feature_1=41.564, feature_2=7.198, feature_3=42.280, feature_4=79.063, feature_5=80.489  | true=517.462  pred=519.353
+row 2: feature_1=44.891, feature_2=53.717, feature_3=20.354, feature_4=15.575, feature_5=88.042  | true=273.521  pred=279.280
+row 3: feature_1=44.417, feature_2=99.360, feature_3=48.856, feature_4=55.041, feature_5=69.442  | true=317.330  pred=315.447
+row 4: feature_1=97.588, feature_2=82.780, feature_3=99.853, feature_4=58.833, feature_5=20.454  | true=748.198  pred=745.436
+row 5: feature_1=16.768, feature_2=8.858, feature_3=20.232, feature_4=10.265, feature_5=52.098  | true=217.055  pred=212.341
+row 6: feature_1=33.156, feature_2=85.503, feature_3=20.708, feature_4=7.116, feature_5=6.901  | true=74.393  pred=74.633
+row 7: feature_1=40.829, feature_2=84.095, feature_3=14.500, feature_4=55.462, feature_5=67.851  | true=211.821  pred=201.482
+row 8: feature_1=18.320, feature_2=62.575, feature_3=97.024, feature_4=52.289, feature_5=18.740  | true=412.293  pred=413.060
+row 9: feature_1=44.706, feature_2=46.036, feature_3=86.456, feature_4=54.665, feature_5=38.040  | true=547.876  pred=548.312
+
+Artifacts saved in: out_reg_csv
+ - model state: out_reg_csv\torch_linear_model.pth
+ - scaler: out_reg_csv\scaler.pkl
+ - predictions preview: out_reg_csv\predictions_preview.csv
+ - training history: out_reg_csv\training_history.csv
+(venv) (base) PS C:\Users\aswin\Desktop\csai\regression> n_samples = 100000  # 100k samples
+n_samples : The term 'n_samples' is not recognized as the name of a cmdlet, function, script file, or operable
+program. Check the spelling of the name, or if a path was included, verify that the path is correct and try again.
+At line:1 char:1
++ n_samples = 100000  # 100k samples
++ ~~~~~~~~~
+    + CategoryInfo          : ObjectNotFound: (n_samples:String) [], CommandNotFoundException
+    + FullyQualifiedErrorId : CommandNotFoundException
+
+(venv) (base) PS C:\Users\aswin\Desktop\csai\regression> @'
+>> import pandas as pd
+>> import numpy as np
+>> from sklearn.model_selection import train_test_split
+>>
+>> # Configuration
+>> n_samples = 50000   # number of total rows (make larger if you want slower/longer training)
+>> n_features = 6      # number of feature columns
+>> np.random.seed(42)
+>>
+>> # Generate random input features (values between 0 and 100)
+>> X = np.random.rand(n_samples, n_features) * 100
+>>
+>> # True underlying weights (controls the relation between features and target)
+>> true_weights = np.array([3.4, -2.8, 4.1, 1.5, 0.8, 2.3])
+>> bias = 10.0
+>>
+>> # Add some noise for realism
+>> noise = np.random.randn(n_samples) * 10
+>>
+>> # Linear target function: y = Xw + b + noise
+>> y = X.dot(true_weights) + bias + noise
+>>
+>> # Build DataFrame
+>> columns = [f"feature_{i+1}" for i in range(n_features)]
+>> df = pd.DataFrame(X, columns=columns)
+>> df["target"] = y
+>>
+>> # Split into 76% train and 24% test
+>> train_df, test_df = train_test_split(df, test_size=0.24, random_state=42)
+>>
+>> # Save to CSV
+>> train_df.to_csv("train_data.csv", index=False)
+>> test_df.to_csv("test_data.csv", index=False)
+>>
+>> print(f"✅ Created dataset with {n_samples} samples and {n_features} features.")
+>> print(f"   Training data: {len(train_df)} rows → train_data.csv")
+>> print(f"   Testing data : {len(test_df)} rows → test_data.csv")
+>> '@ | Out-File -Encoding utf8 make_train_test_dataset.py
+(venv) (base) PS C:\Users\aswin\Desktop\csai\regression> .\venv\Scripts\python.exe make_train_test_dataset.py
+✅ Created dataset with 50000 samples and 6 features.
+   Training data: 38000 rows → train_data.csv
+   Testing data : 12000 rows → test_data.csv
+(venv) (base) PS C:\Users\aswin\Desktop\csai\regression> .\venv\Scripts\python.exe train_from_csv.py --csv train_data.csv --target target --epochs 300 --batch-size 512
+Loading CSV dataset...
+Loaded dataset with 38000 samples and 6 features.
+Feature columns: ['feature_1', 'feature_2', 'feature_3', 'feature_4', 'feature_5', 'feature_6']
+Train samples: 30400, Test samples: 7600
+Saved scaler to: out_reg_csv\scaler.pkl
+Using device: cpu
+
+Starting training...
+Epoch 001: loss=101371.101855  time=0.229s
+Epoch 002: loss=8993.983541  time=0.380s
+Epoch 003: loss=884.021486  time=0.216s
+Epoch 004: loss=169.266579  time=0.224s
+Epoch 005: loss=106.229678  time=0.194s
+Epoch 006: loss=100.381949  time=0.196s
+Epoch 007: loss=99.987960  time=0.238s
+Epoch 008: loss=99.949794  time=0.199s
+Epoch 009: loss=99.915023  time=0.414s
+Epoch 010: loss=100.120598  time=0.251s
+Epoch 011: loss=99.877518  time=0.237s
+Epoch 012: loss=99.906448  time=0.232s
+Epoch 013: loss=99.916906  time=0.217s
+Epoch 014: loss=100.100374  time=0.229s
+Epoch 015: loss=99.823004  time=0.239s
+Epoch 016: loss=99.881434  time=0.221s
+Epoch 017: loss=100.021102  time=0.384s
+Epoch 018: loss=99.933556  time=0.181s
+Epoch 019: loss=99.901822  time=0.256s
+Epoch 020: loss=99.773589  time=0.318s
+Epoch 021: loss=99.917794  time=0.283s
+Epoch 022: loss=99.782388  time=0.210s
+Epoch 023: loss=99.996460  time=0.220s
+Epoch 024: loss=99.809502  time=0.381s
+Epoch 025: loss=99.967710  time=0.243s
+Epoch 026: loss=99.947776  time=0.217s
+Epoch 027: loss=99.834705  time=0.210s
+Epoch 028: loss=99.861945  time=0.267s
+Epoch 029: loss=99.949783  time=0.216s
+Epoch 030: loss=100.083956  time=0.231s
+Epoch 031: loss=99.944769  time=0.360s
+Epoch 032: loss=100.003910  time=0.323s
+Epoch 033: loss=99.949285  time=0.240s
+Epoch 034: loss=100.002553  time=0.325s
+Epoch 035: loss=100.123197  time=0.208s
+Epoch 036: loss=99.820658  time=0.226s
+Epoch 037: loss=100.083321  time=0.197s
+Epoch 038: loss=99.876431  time=0.340s
+Epoch 039: loss=99.897363  time=0.256s
+Epoch 040: loss=99.881952  time=0.295s
+Epoch 041: loss=99.884806  time=0.233s
+Epoch 042: loss=99.879283  time=0.227s
+Epoch 043: loss=99.884009  time=0.228s
+Epoch 044: loss=99.878063  time=0.261s
+Epoch 045: loss=99.720280  time=0.375s
+Epoch 046: loss=99.925794  time=0.205s
+Epoch 047: loss=99.987113  time=0.224s
+Epoch 048: loss=99.821652  time=0.283s
+Epoch 049: loss=99.866828  time=0.208s
+Epoch 050: loss=100.030039  time=0.195s
+Epoch 051: loss=99.853900  time=0.243s
+Epoch 052: loss=99.902642  time=0.352s
+Epoch 053: loss=100.008803  time=0.231s
+Epoch 054: loss=99.712479  time=0.216s
+Epoch 055: loss=100.020387  time=0.219s
+Epoch 056: loss=99.802615  time=0.237s
+Epoch 057: loss=99.899823  time=0.283s
+Epoch 058: loss=99.862456  time=0.341s
+Epoch 059: loss=100.021330  time=0.362s
+Epoch 060: loss=100.034622  time=0.238s
+Epoch 061: loss=99.684398  time=0.246s
+Epoch 062: loss=100.011736  time=0.222s
+Epoch 063: loss=99.913012  time=0.191s
+Epoch 064: loss=100.010308  time=0.251s
+Epoch 065: loss=99.955369  time=0.379s
+Epoch 066: loss=99.974287  time=0.574s
+Epoch 067: loss=100.083168  time=0.253s
+Epoch 068: loss=100.100772  time=0.244s
+Epoch 069: loss=100.007180  time=0.383s
+Epoch 070: loss=99.909448  time=0.407s
+Epoch 071: loss=99.883395  time=0.285s
+Epoch 072: loss=99.820726  time=0.205s
+Epoch 073: loss=100.054474  time=0.533s
+Epoch 074: loss=99.866416  time=0.735s
+Epoch 075: loss=99.991167  time=0.725s
+Epoch 076: loss=99.953602  time=0.724s
+Epoch 077: loss=99.924814  time=0.733s
+Epoch 078: loss=99.941543  time=0.714s
+Epoch 079: loss=100.021841  time=0.827s
+Epoch 080: loss=99.928922  time=0.937s
+Epoch 081: loss=99.964407  time=0.703s
+Epoch 082: loss=99.903643  time=0.747s
+Epoch 083: loss=100.064356  time=0.692s
+Epoch 084: loss=99.926354  time=0.708s
+Epoch 085: loss=99.765662  time=0.721s
+Epoch 086: loss=99.967763  time=0.395s
+Epoch 087: loss=100.006590  time=0.371s
+Epoch 088: loss=100.038015  time=0.245s
+Epoch 089: loss=99.987570  time=0.228s
+Epoch 090: loss=99.803871  time=0.219s
+Epoch 091: loss=99.915776  time=0.184s
+Epoch 092: loss=99.993961  time=0.229s
+Epoch 093: loss=100.024570  time=0.227s
+Epoch 094: loss=99.771224  time=0.393s
+Epoch 095: loss=99.849969  time=0.270s
+Epoch 096: loss=99.942475  time=0.259s
+Epoch 097: loss=100.023620  time=0.205s
+Epoch 098: loss=99.952937  time=0.219s
+Epoch 099: loss=99.803453  time=0.272s
+Epoch 100: loss=99.875274  time=0.314s
+Epoch 101: loss=99.937070  time=0.567s
+Epoch 102: loss=99.805558  time=0.425s
+Epoch 103: loss=99.852026  time=0.401s
+Epoch 104: loss=100.072385  time=0.373s
+Epoch 105: loss=100.018309  time=0.319s
+Epoch 106: loss=99.930887  time=0.273s
+Epoch 107: loss=99.934209  time=0.235s
+Epoch 108: loss=99.740704  time=0.494s
+Epoch 109: loss=100.024424  time=0.207s
+Epoch 110: loss=100.069682  time=0.205s
+Epoch 111: loss=99.998054  time=0.359s
+Epoch 112: loss=99.817144  time=0.346s
+Epoch 113: loss=100.000399  time=0.276s
+Epoch 114: loss=100.066250  time=0.220s
+Epoch 115: loss=100.068373  time=0.473s
+Epoch 116: loss=99.804027  time=0.292s
+Epoch 117: loss=100.127164  time=0.326s
+Epoch 118: loss=99.877047  time=0.353s
+Epoch 119: loss=99.719617  time=0.248s
+Epoch 120: loss=99.938046  time=0.223s
+Epoch 121: loss=99.906698  time=0.277s
+Epoch 122: loss=99.986454  time=0.423s
+Epoch 123: loss=99.949109  time=0.287s
+Epoch 124: loss=100.105380  time=0.279s
+Epoch 125: loss=100.011359  time=0.392s
+Epoch 126: loss=99.935492  time=0.219s
+Epoch 127: loss=99.824090  time=0.214s
+Epoch 128: loss=100.007147  time=0.257s
+Epoch 129: loss=99.808847  time=0.451s
+Epoch 130: loss=100.032474  time=0.485s
+Epoch 131: loss=100.279442  time=0.409s
+Epoch 132: loss=99.989075  time=0.209s
+Epoch 133: loss=99.879931  time=0.215s
+Epoch 134: loss=100.019727  time=0.203s
+Epoch 135: loss=99.992385  time=0.221s
+Epoch 136: loss=99.987721  time=0.432s
+Epoch 137: loss=99.939192  time=0.468s
+Epoch 138: loss=99.871915  time=0.240s
+Epoch 139: loss=99.924717  time=0.196s
+Epoch 140: loss=99.984655  time=0.209s
+Epoch 141: loss=99.845931  time=0.264s
+Epoch 142: loss=99.983139  time=0.358s
+Epoch 143: loss=99.831711  time=0.434s
+Epoch 144: loss=99.840345  time=0.429s
+Epoch 145: loss=100.001494  time=0.281s
+Epoch 146: loss=99.825022  time=0.280s
+Epoch 147: loss=100.014081  time=0.525s
+Epoch 148: loss=99.700076  time=0.539s
+Epoch 149: loss=100.258477  time=0.550s
+Epoch 150: loss=100.104528  time=0.396s
+Epoch 151: loss=99.903840  time=0.546s
+Epoch 152: loss=99.914698  time=0.568s
+Epoch 153: loss=99.870717  time=0.486s
+Epoch 154: loss=99.908521  time=0.327s
+Epoch 155: loss=100.126428  time=0.307s
+Epoch 156: loss=99.788569  time=0.223s
+Epoch 157: loss=99.887774  time=0.597s
+Epoch 158: loss=99.878437  time=0.464s
+Epoch 159: loss=99.906661  time=0.280s
+Epoch 160: loss=99.898239  time=0.233s
+Epoch 161: loss=99.806872  time=0.230s
+Epoch 162: loss=99.854483  time=0.335s
+Epoch 163: loss=99.963826  time=0.415s
+Epoch 164: loss=100.057733  time=0.581s
+Epoch 165: loss=99.925978  time=0.437s
+Epoch 166: loss=99.785724  time=0.376s
+Epoch 167: loss=100.175680  time=0.338s
+Epoch 168: loss=99.866032  time=0.418s
+Epoch 169: loss=99.904858  time=0.419s
+Epoch 170: loss=99.940900  time=0.437s
+Epoch 171: loss=100.106751  time=0.419s
+Epoch 172: loss=99.813477  time=0.536s
+Epoch 173: loss=100.061768  time=0.544s
+Epoch 174: loss=99.994055  time=0.328s
+Epoch 175: loss=99.923707  time=0.352s
+Epoch 176: loss=99.909037  time=0.338s
+Epoch 177: loss=100.098255  time=0.530s
+Epoch 178: loss=100.118257  time=0.864s
+Epoch 179: loss=99.855918  time=0.312s
+Epoch 180: loss=99.896000  time=0.337s
+Epoch 181: loss=99.892229  time=0.558s
+Epoch 182: loss=99.879211  time=0.499s
+Epoch 183: loss=99.938754  time=0.321s
+Epoch 184: loss=100.153074  time=0.319s
+Epoch 185: loss=99.934900  time=0.503s
+Epoch 186: loss=99.974811  time=0.522s
+Epoch 187: loss=99.982498  time=0.335s
+Epoch 188: loss=99.990522  time=0.238s
+Epoch 189: loss=99.938113  time=0.219s
+Epoch 190: loss=99.852597  time=0.252s
+Epoch 191: loss=99.857045  time=0.317s
+Epoch 192: loss=100.040528  time=0.735s
+Epoch 193: loss=99.938303  time=0.355s
+Epoch 194: loss=99.852303  time=0.410s
+Epoch 195: loss=99.960374  time=0.203s
+Epoch 196: loss=99.799409  time=0.253s
+Epoch 197: loss=99.992067  time=0.422s
+Epoch 198: loss=99.898204  time=0.349s
+Epoch 199: loss=100.002772  time=0.343s
+Epoch 200: loss=99.812350  time=0.259s
+Epoch 201: loss=99.733672  time=0.293s
+Epoch 202: loss=99.866402  time=0.383s
+Epoch 203: loss=100.180141  time=0.587s
+Epoch 204: loss=99.935390  time=0.431s
+Epoch 205: loss=100.061325  time=0.336s
+Epoch 206: loss=99.885749  time=0.616s
+Epoch 207: loss=99.952929  time=0.503s
+Epoch 208: loss=99.947939  time=0.395s
+Epoch 209: loss=99.837695  time=0.488s
+Epoch 210: loss=100.019486  time=0.698s
+Epoch 211: loss=99.940500  time=0.578s
+Epoch 212: loss=99.900916  time=0.438s
+Epoch 213: loss=99.932341  time=0.683s
+Epoch 214: loss=99.974167  time=0.301s
+Epoch 215: loss=99.960843  time=0.462s
+Epoch 216: loss=99.938964  time=0.343s
+Epoch 217: loss=99.979281  time=0.323s
+Epoch 218: loss=99.943701  time=0.354s
+Epoch 219: loss=99.817217  time=0.410s
+Epoch 220: loss=99.880145  time=0.471s
+Epoch 221: loss=99.950544  time=0.304s
+Epoch 222: loss=100.013172  time=0.260s
+Epoch 223: loss=99.747328  time=0.189s
+Epoch 224: loss=99.980393  time=0.192s
+Epoch 225: loss=99.952943  time=0.236s
+Epoch 226: loss=99.933790  time=0.267s
+Epoch 227: loss=99.938247  time=0.327s
+Epoch 228: loss=99.856090  time=0.248s
+Epoch 229: loss=100.158935  time=0.235s
+Epoch 230: loss=99.893495  time=0.352s
+Epoch 231: loss=99.971065  time=0.220s
+Epoch 232: loss=100.071315  time=0.232s
+Epoch 233: loss=99.942580  time=0.211s
+Epoch 234: loss=100.040616  time=0.351s
+Epoch 235: loss=99.900704  time=0.261s
+Epoch 236: loss=99.864578  time=0.208s
+Epoch 237: loss=99.877952  time=0.228s
+Epoch 238: loss=99.809972  time=0.294s
+Epoch 239: loss=99.920907  time=0.191s
+Epoch 240: loss=99.801423  time=0.216s
+Epoch 241: loss=99.913147  time=0.302s
+Epoch 242: loss=99.916726  time=0.252s
+Epoch 243: loss=99.850696  time=0.292s
+Epoch 244: loss=99.962722  time=0.242s
+Epoch 245: loss=100.085217  time=0.266s
+Epoch 246: loss=99.857113  time=0.258s
+Epoch 247: loss=100.001393  time=0.200s
+Epoch 248: loss=99.850907  time=0.323s
+Epoch 249: loss=100.018737  time=0.235s
+Epoch 250: loss=100.034214  time=0.188s
+Epoch 251: loss=100.237514  time=0.229s
+Epoch 252: loss=99.929092  time=0.285s
+Epoch 253: loss=99.904657  time=0.269s
+Epoch 254: loss=99.867125  time=0.314s
+Epoch 255: loss=100.012884  time=0.343s
+Epoch 256: loss=99.828108  time=0.216s
+Epoch 257: loss=100.120241  time=0.262s
+Epoch 258: loss=100.070900  time=0.178s
+Epoch 259: loss=99.868270  time=0.234s
+Epoch 260: loss=100.137565  time=0.316s
+Epoch 261: loss=99.835636  time=0.333s
+Epoch 262: loss=99.922079  time=0.521s
+Epoch 263: loss=99.968473  time=0.429s
+Epoch 264: loss=99.841738  time=0.629s
+Epoch 265: loss=99.960510  time=0.444s
+Epoch 266: loss=100.011672  time=0.459s
+Epoch 267: loss=99.854163  time=0.345s
+Epoch 268: loss=99.907008  time=0.220s
+Epoch 269: loss=100.018343  time=0.434s
+Epoch 270: loss=99.823616  time=0.456s
+Epoch 271: loss=99.812349  time=0.430s
+Epoch 272: loss=100.067995  time=0.358s
+Epoch 273: loss=99.929392  time=0.540s
+Epoch 274: loss=99.851276  time=0.441s
+Epoch 275: loss=99.847962  time=0.619s
+Epoch 276: loss=99.905862  time=0.847s
+Epoch 277: loss=99.804974  time=0.624s
+Epoch 278: loss=99.924877  time=0.249s
+Epoch 279: loss=100.073829  time=0.232s
+Epoch 280: loss=99.924531  time=0.354s
+Epoch 281: loss=99.933005  time=0.332s
+Epoch 282: loss=99.945507  time=0.281s
+Epoch 283: loss=99.724578  time=0.458s
+Epoch 284: loss=100.107289  time=0.383s
+Epoch 285: loss=99.958571  time=0.204s
+Epoch 286: loss=100.276598  time=0.263s
+Epoch 287: loss=100.006857  time=0.273s
+Epoch 288: loss=100.032838  time=0.235s
+Epoch 289: loss=99.875725  time=0.335s
+Epoch 290: loss=100.139953  time=0.418s
+Epoch 291: loss=99.820437  time=0.264s
+Epoch 292: loss=100.034424  time=0.207s
+Epoch 293: loss=99.862739  time=0.413s
+Epoch 294: loss=99.818920  time=0.276s
+Epoch 295: loss=99.809456  time=0.294s
+Epoch 296: loss=99.866979  time=0.241s
+Epoch 297: loss=99.966470  time=0.524s
+Epoch 298: loss=99.816448  time=0.239s
+Epoch 299: loss=100.236888  time=0.332s
+Epoch 300: loss=100.075164  time=0.272s
+Saved model state to: out_reg_csv\torch_linear_model.pth
+
+=== Final evaluation on test set ===
+MSE  : 99.262939
+RMSE : 9.963079
+R^2  : 0.997294
+Saved prediction preview to: out_reg_csv\predictions_preview.csv
+Saved training history (epoch loss/time) to: out_reg_csv\training_history.csv
+
+Sample predictions (first 10 rows of preview):
+row 0: feature_1=7.538, feature_2=7.393, feature_3=4.433, feature_4=24.570, feature_5=9.966, feature_6=28.925  | true=158.589  pred=144.386
+row 1: feature_1=18.290, feature_2=25.257, feature_3=71.727, feature_4=37.588, feature_5=68.748, feature_6=51.411  | true=537.272  pred=525.072
+row 2: feature_1=26.670, feature_2=56.769, feature_3=56.638, feature_4=8.373, feature_5=53.942, feature_6=96.438  | true=442.052  pred=451.274
+row 3: feature_1=40.952, feature_2=80.125, feature_3=13.191, feature_4=96.280, feature_5=36.154, feature_6=50.483  | true=254.637  pred=268.596
+row 4: feature_1=63.226, feature_2=70.936, feature_3=45.502, feature_4=5.183, feature_5=87.365, feature_6=12.930  | true=334.019  pred=320.229
+row 5: feature_1=27.035, feature_2=17.153, feature_3=9.890, feature_4=15.613, feature_5=55.215, feature_6=93.758  | true=355.329  pred=377.672
+row 6: feature_1=95.300, feature_2=75.746, feature_3=67.511, feature_4=87.438, feature_5=21.725, feature_6=34.917  | true=642.151  pred=627.528
+row 7: feature_1=61.773, feature_2=72.300, feature_3=0.739, feature_4=35.220, feature_5=2.643, feature_6=56.075  | true=196.044  pred=204.481
+row 8: feature_1=36.548, feature_2=34.382, feature_3=27.931, feature_4=32.073, feature_5=13.968, feature_6=1.292  | true=234.001  pred=214.651
+row 9: feature_1=80.072, feature_2=87.722, feature_3=32.387, feature_4=95.299, feature_5=49.366, feature_6=87.240  | true=534.861  pred=552.653
+
+Artifacts saved in: out_reg_csv
+ - model state: out_reg_csv\torch_linear_model.pth
+ - scaler: out_reg_csv\scaler.pkl
+ - predictions preview: out_reg_csv\predictions_preview.csv
+ - training history: out_reg_csv\training_history.csv
+(venv) (base) PS C:\Users\aswin\Desktop\csai\regression> .\venv\Scripts\python.exe train_from_csv.py --csv train_data.csv --target target --epochs 1000 --batch-size 512 --lr 0.0005
+Loading CSV dataset...
+Loaded dataset with 38000 samples and 6 features.
+Feature columns: ['feature_1', 'feature_2', 'feature_3', 'feature_4', 'feature_5', 'feature_6']
+Train samples: 30400, Test samples: 7600
+Saved scaler to: out_reg_csv\scaler.pkl
+Using device: cpu
+
+Starting training...
+Epoch 001: loss=249614.679688  time=0.284s
+Epoch 002: loss=220995.742448  time=0.344s
+Epoch 003: loss=195966.970833  time=0.200s
+Epoch 004: loss=173672.760417  time=0.252s
+Epoch 005: loss=154125.844010  time=0.219s
+Epoch 006: loss=136720.323698  time=0.205s
+Epoch 007: loss=121167.535547  time=0.250s
+Epoch 008: loss=107380.032422  time=0.245s
+Epoch 009: loss=95273.062240  time=0.315s
+Epoch 010: loss=84454.949870  time=0.247s
+Epoch 011: loss=74975.408073  time=0.204s
+Epoch 012: loss=66448.086263  time=0.219s
+Epoch 013: loss=58956.972331  time=0.224s
+Epoch 014: loss=52254.645182  time=0.201s
+Epoch 015: loss=46377.848698  time=0.276s
+Epoch 016: loss=41106.838607  time=0.313s
+Epoch 017: loss=36471.729980  time=0.338s
+Epoch 018: loss=32355.212793  time=0.292s
+Epoch 019: loss=28695.635254  time=0.263s
+Epoch 020: loss=25452.226628  time=0.255s
+Epoch 021: loss=22596.324609  time=0.280s
+Epoch 022: loss=20049.326204  time=0.227s
+Epoch 023: loss=17784.638005  time=0.348s
+Epoch 024: loss=15779.891536  time=0.700s
+Epoch 025: loss=14008.133366  time=0.310s
+Epoch 026: loss=12420.944808  time=0.262s
+Epoch 027: loss=11042.996208  time=0.263s
+Epoch 028: loss=9795.106478  time=0.245s
+Epoch 029: loss=8688.510856  time=0.241s
+Epoch 030: loss=7723.962329  time=0.283s
+Epoch 031: loss=6852.533472  time=0.431s
+Epoch 032: loss=6095.974764  time=0.352s
+Epoch 033: loss=5415.667163  time=0.440s
+Epoch 034: loss=4810.855257  time=0.339s
+Epoch 035: loss=4277.373958  time=0.340s
+Epoch 036: loss=3799.645931  time=0.440s
+Epoch 037: loss=3381.089933  time=0.384s
+Epoch 038: loss=3013.948250  time=0.384s
+Epoch 039: loss=2683.962569  time=0.287s
+Epoch 040: loss=2392.205375  time=0.221s
+Epoch 041: loss=2131.065365  time=0.279s
+Epoch 042: loss=1899.693778  time=0.289s
+Epoch 043: loss=1695.738542  time=0.359s
+Epoch 044: loss=1514.718298  time=0.464s
+Epoch 045: loss=1353.885895  time=0.548s
+Epoch 046: loss=1213.014785  time=0.527s
+Epoch 047: loss=1086.804512  time=0.512s
+Epoch 048: loss=974.993869  time=0.461s
+Epoch 049: loss=875.504711  time=0.470s
+Epoch 050: loss=788.848734  time=0.522s
+Epoch 051: loss=710.545836  time=0.495s
+Epoch 052: loss=641.177809  time=0.722s
+Epoch 053: loss=578.764641  time=0.509s
+Epoch 054: loss=524.845599  time=0.448s
+Epoch 055: loss=476.677315  time=0.588s
+Epoch 056: loss=433.969588  time=0.909s
+Epoch 057: loss=396.581263  time=0.972s
+Epoch 058: loss=362.785913  time=0.876s
+Epoch 059: loss=333.413760  time=1.064s
+Epoch 060: loss=307.196114  time=0.763s
+Epoch 061: loss=282.878135  time=0.715s
+Epoch 062: loss=262.301668  time=0.982s
+Epoch 063: loss=243.916259  time=0.811s
+Epoch 064: loss=227.830181  time=0.979s
+Epoch 065: loss=213.294040  time=1.037s
+Epoch 066: loss=200.438936  time=1.540s
+Epoch 067: loss=188.746968  time=0.918s
+Epoch 068: loss=179.017885  time=0.811s
+Epoch 069: loss=169.969434  time=0.912s
+Epoch 070: loss=161.939747  time=0.891s
+Epoch 071: loss=154.798909  time=1.533s
+Epoch 072: loss=148.561302  time=1.199s
+Epoch 073: loss=143.261017  time=1.059s
+Epoch 074: loss=138.276926  time=0.752s
+Epoch 075: loss=134.086080  time=0.830s
+Epoch 076: loss=130.060778  time=0.840s
+Epoch 077: loss=126.681804  time=1.045s
+Epoch 078: loss=123.647639  time=0.776s
+Epoch 079: loss=121.124756  time=0.760s
+Epoch 080: loss=118.638781  time=1.085s
+Epoch 081: loss=116.555404  time=0.699s
+Epoch 082: loss=114.526801  time=0.693s
+Epoch 083: loss=113.028904  time=0.455s
+Epoch 084: loss=111.484440  time=0.358s
+Epoch 085: loss=109.886403  time=0.238s
+Epoch 086: loss=108.991017  time=0.256s
+Epoch 087: loss=108.039246  time=0.353s
+Epoch 088: loss=107.185035  time=0.332s
+Epoch 089: loss=106.265289  time=0.338s
+Epoch 090: loss=105.379748  time=0.288s
+Epoch 091: loss=104.891927  time=0.267s
+Epoch 092: loss=104.383052  time=0.258s
+Epoch 093: loss=103.901926  time=0.345s
+Epoch 094: loss=103.232798  time=0.530s
+Epoch 095: loss=102.915594  time=0.202s
+Epoch 096: loss=102.619062  time=0.302s
+Epoch 097: loss=102.396728  time=0.218s
+Epoch 098: loss=102.076682  time=0.288s
+Epoch 099: loss=101.677270  time=0.302s
+Epoch 100: loss=101.529420  time=0.284s
+Epoch 101: loss=101.419454  time=0.462s
+Epoch 102: loss=101.116090  time=0.414s
+Epoch 103: loss=100.992689  time=0.290s
+Epoch 104: loss=101.102279  time=0.305s
+Epoch 105: loss=100.930873  time=0.355s
+Epoch 106: loss=100.724665  time=0.272s
+Epoch 107: loss=100.621719  time=0.336s
+Epoch 108: loss=100.370664  time=0.389s
+Epoch 109: loss=100.568144  time=0.238s
+Epoch 110: loss=100.573510  time=0.313s
+Epoch 111: loss=100.424646  time=0.353s
+Epoch 112: loss=100.198759  time=0.241s
+Epoch 113: loss=100.331623  time=0.272s
+Epoch 114: loss=100.357606  time=0.303s
+Epoch 115: loss=100.326935  time=0.536s
+Epoch 116: loss=100.029117  time=0.397s
+Epoch 117: loss=100.309367  time=0.341s
+Epoch 118: loss=100.044814  time=0.379s
+Epoch 119: loss=99.874000  time=0.380s
+Epoch 120: loss=100.071748  time=0.329s
+Epoch 121: loss=100.016847  time=0.275s
+Epoch 122: loss=100.079734  time=0.559s
+Epoch 123: loss=100.041098  time=0.276s
+Epoch 124: loss=100.168586  time=0.416s
+Epoch 125: loss=100.072498  time=0.321s
+Epoch 126: loss=99.992726  time=0.303s
+Epoch 127: loss=99.872570  time=0.305s
+Epoch 128: loss=100.042100  time=0.362s
+Epoch 129: loss=99.836745  time=0.638s
+Epoch 130: loss=100.052253  time=0.353s
+Epoch 131: loss=100.298318  time=0.233s
+Epoch 132: loss=100.003437  time=0.417s
+Epoch 133: loss=99.888105  time=0.381s
+Epoch 134: loss=100.028349  time=0.425s
+Epoch 135: loss=99.989800  time=0.430s
+Epoch 136: loss=99.990295  time=0.453s
+Epoch 137: loss=99.930754  time=0.210s
+Epoch 138: loss=99.862675  time=0.311s
+Epoch 139: loss=99.918568  time=0.293s
+Epoch 140: loss=99.981627  time=0.219s
+Epoch 141: loss=99.834337  time=0.385s
+Epoch 142: loss=99.969091  time=0.368s
+Epoch 143: loss=99.820255  time=0.465s
+Epoch 144: loss=99.823508  time=0.433s
+Epoch 145: loss=99.989236  time=0.418s
+Epoch 146: loss=99.809934  time=0.432s
+Epoch 147: loss=99.995083  time=0.390s
+Epoch 148: loss=99.682608  time=0.212s
+Epoch 149: loss=100.240113  time=0.373s
+Epoch 150: loss=100.084315  time=0.415s
+Epoch 151: loss=99.885333  time=0.480s
+Epoch 152: loss=99.892613  time=0.403s
+Epoch 153: loss=99.848659  time=0.402s
+Epoch 154: loss=99.891004  time=0.364s
+Epoch 155: loss=100.109688  time=0.337s
+Epoch 156: loss=99.764748  time=0.370s
+Epoch 157: loss=99.865406  time=0.411s
+Epoch 158: loss=99.858709  time=0.309s
+Epoch 159: loss=99.889242  time=0.261s
+Epoch 160: loss=99.875461  time=0.270s
+Epoch 161: loss=99.782874  time=0.301s
+Epoch 162: loss=99.837293  time=0.320s
+Epoch 163: loss=99.942707  time=0.325s
+Epoch 164: loss=100.033717  time=0.406s
+Epoch 165: loss=99.907166  time=0.357s
+Epoch 166: loss=99.765759  time=0.332s
+Epoch 167: loss=100.153766  time=0.362s
+Epoch 168: loss=99.844512  time=0.385s
+Epoch 169: loss=99.881442  time=0.367s
+Epoch 170: loss=99.919280  time=0.413s
+Epoch 171: loss=100.081665  time=0.510s
+Epoch 172: loss=99.791773  time=0.364s
+Epoch 173: loss=100.039556  time=0.383s
+Epoch 174: loss=99.970909  time=0.301s
+Epoch 175: loss=99.897077  time=0.459s
+Epoch 176: loss=99.888941  time=0.475s
+Epoch 177: loss=100.081465  time=0.485s
+Epoch 178: loss=100.092959  time=0.471s
+Epoch 179: loss=99.833131  time=0.369s
+Epoch 180: loss=99.874750  time=0.224s
+Epoch 181: loss=99.870141  time=0.442s
+Epoch 182: loss=99.861769  time=0.334s
+Epoch 183: loss=99.915534  time=0.490s
+Epoch 184: loss=100.130432  time=0.262s
+Epoch 185: loss=99.912085  time=0.464s
+Epoch 186: loss=99.952322  time=0.261s
+Epoch 187: loss=99.958235  time=0.321s
+Epoch 188: loss=99.967808  time=0.373s
+Epoch 189: loss=99.915965  time=0.251s
+Epoch 190: loss=99.832290  time=0.372s
+Epoch 191: loss=99.834427  time=0.299s
+Epoch 192: loss=100.019806  time=0.393s
+Epoch 193: loss=99.912709  time=0.415s
+Epoch 194: loss=99.830724  time=0.276s
+Epoch 195: loss=99.936193  time=0.318s
+Epoch 196: loss=99.779727  time=0.452s
+Epoch 197: loss=99.969995  time=0.340s
+Epoch 198: loss=99.876250  time=0.266s
+Epoch 199: loss=99.980876  time=0.623s
+Epoch 200: loss=99.788060  time=0.490s
+Epoch 201: loss=99.711825  time=0.351s
+Epoch 202: loss=99.841652  time=0.382s
+Epoch 203: loss=100.155933  time=0.385s
+Epoch 204: loss=99.910922  time=0.382s
+Epoch 205: loss=100.041357  time=0.472s
+Epoch 206: loss=99.862466  time=0.592s
+Epoch 207: loss=99.927009  time=0.445s
+Epoch 208: loss=99.923073  time=0.367s
+Epoch 209: loss=99.820102  time=0.338s
+Epoch 210: loss=99.994068  time=0.427s
+Epoch 211: loss=99.917039  time=0.449s
+Epoch 212: loss=99.880146  time=0.428s
+Epoch 213: loss=99.910810  time=0.529s
+Epoch 214: loss=99.952656  time=0.409s
+Epoch 215: loss=99.937297  time=0.288s
+Epoch 216: loss=99.920981  time=0.422s
+Epoch 217: loss=99.959591  time=0.478s
+Epoch 218: loss=99.921149  time=0.405s
+Epoch 219: loss=99.791404  time=0.390s
+Epoch 220: loss=99.859824  time=0.601s
+Epoch 221: loss=99.931915  time=0.489s
+Epoch 222: loss=99.985976  time=0.353s
+Epoch 223: loss=99.723625  time=0.289s
+Epoch 224: loss=99.958563  time=0.264s
+Epoch 225: loss=99.933779  time=0.267s
+Epoch 226: loss=99.911290  time=0.248s
+Epoch 227: loss=99.918345  time=0.494s
+Epoch 228: loss=99.830393  time=0.375s
+Epoch 229: loss=100.136008  time=0.402s
+Epoch 230: loss=99.870838  time=0.353s
+Epoch 231: loss=99.946042  time=0.391s
+Epoch 232: loss=100.046703  time=0.265s
+Epoch 233: loss=99.920527  time=0.340s
+Epoch 234: loss=100.020848  time=0.438s
+Epoch 235: loss=99.879910  time=0.396s
+Epoch 236: loss=99.838466  time=0.386s
+Epoch 237: loss=99.854255  time=0.299s
+Epoch 238: loss=99.790953  time=0.352s
+Epoch 239: loss=99.899628  time=0.284s
+Epoch 240: loss=99.781992  time=0.405s
+Epoch 241: loss=99.888968  time=0.595s
+Epoch 242: loss=99.893341  time=0.358s
+Epoch 243: loss=99.830519  time=0.432s
+Epoch 244: loss=99.946765  time=0.369s
+Epoch 245: loss=100.064572  time=0.390s
+Epoch 246: loss=99.837439  time=0.360s
+Epoch 247: loss=99.975822  time=0.370s
+Epoch 248: loss=99.832644  time=0.583s
+Epoch 249: loss=99.994777  time=0.431s
+Epoch 250: loss=100.014401  time=0.431s
+Epoch 251: loss=100.213819  time=0.412s
+Epoch 252: loss=99.906287  time=0.448s
+Epoch 253: loss=99.878855  time=0.390s
+Epoch 254: loss=99.845155  time=0.342s
+Epoch 255: loss=99.992900  time=0.538s
+Epoch 256: loss=99.805061  time=0.345s
+Epoch 257: loss=100.097362  time=0.380s
+Epoch 258: loss=100.043102  time=0.355s
+Epoch 259: loss=99.844315  time=0.350s
+Epoch 260: loss=100.115590  time=0.425s
+Epoch 261: loss=99.811863  time=0.394s
+Epoch 262: loss=99.900682  time=0.584s
+Epoch 263: loss=99.947714  time=0.450s
+Epoch 264: loss=99.819044  time=0.469s
+Epoch 265: loss=99.937063  time=0.303s
+Epoch 266: loss=99.989257  time=0.400s
+Epoch 267: loss=99.831284  time=0.427s
+Epoch 268: loss=99.883606  time=0.388s
+Epoch 269: loss=99.999316  time=0.555s
+Epoch 270: loss=99.799089  time=0.294s
+Epoch 271: loss=99.789215  time=0.360s
+Epoch 272: loss=100.048420  time=0.367s
+Epoch 273: loss=99.909057  time=0.345s
+Epoch 274: loss=99.830492  time=0.395s
+Epoch 275: loss=99.827549  time=0.385s
+Epoch 276: loss=99.880481  time=0.569s
+Epoch 277: loss=99.782194  time=0.405s
+Epoch 278: loss=99.898792  time=0.407s
+Epoch 279: loss=100.057774  time=0.434s
+Epoch 280: loss=99.900281  time=0.339s
+Epoch 281: loss=99.912398  time=0.362s
+Epoch 282: loss=99.928954  time=0.334s
+Epoch 283: loss=99.704747  time=0.630s
+Epoch 284: loss=100.082662  time=0.435s
+Epoch 285: loss=99.933410  time=0.344s
+Epoch 286: loss=100.255902  time=0.392s
+Epoch 287: loss=99.983053  time=0.454s
+Epoch 288: loss=100.010655  time=0.415s
+Epoch 289: loss=99.850394  time=0.390s
+Epoch 290: loss=100.119124  time=0.495s
+Epoch 291: loss=99.798398  time=0.403s
+Epoch 292: loss=100.010772  time=0.404s
+Epoch 293: loss=99.839412  time=0.472s
+Epoch 294: loss=99.796060  time=0.423s
+Epoch 295: loss=99.788443  time=0.317s
+Epoch 296: loss=99.844935  time=0.395s
+Epoch 297: loss=99.941391  time=0.524s
+Epoch 298: loss=99.791406  time=0.387s
+Epoch 299: loss=100.216073  time=0.354s
+Epoch 300: loss=100.053567  time=0.335s
+Epoch 301: loss=100.025225  time=0.361s
+Epoch 302: loss=99.955520  time=0.386s
+Epoch 303: loss=99.772592  time=0.406s
+Epoch 304: loss=99.992298  time=0.637s
+Epoch 305: loss=99.838250  time=0.311s
+Epoch 306: loss=99.924367  time=0.341s
+Epoch 307: loss=99.967999  time=0.216s
+Epoch 308: loss=99.840884  time=0.211s
+Epoch 309: loss=99.956659  time=0.239s
+Epoch 310: loss=99.922117  time=0.236s
+Epoch 311: loss=100.024056  time=0.517s
+Epoch 312: loss=99.973692  time=0.342s
+Epoch 313: loss=99.919475  time=0.479s
+Epoch 314: loss=99.795596  time=0.443s
+Epoch 315: loss=99.879649  time=0.460s
+Epoch 316: loss=99.974800  time=0.437s
+Epoch 317: loss=99.705070  time=0.340s
+Epoch 318: loss=100.034930  time=0.447s
+Epoch 319: loss=99.843401  time=0.422s
+Epoch 320: loss=99.813426  time=0.414s
+Epoch 321: loss=99.921650  time=0.434s
+Epoch 322: loss=99.819020  time=0.378s
+Epoch 323: loss=100.003823  time=0.437s
+Epoch 324: loss=99.989442  time=0.439s
+Epoch 325: loss=99.953366  time=0.574s
+Epoch 326: loss=99.951544  time=0.399s
+Epoch 327: loss=100.035397  time=0.335s
+Epoch 328: loss=99.961890  time=0.411s
+Epoch 329: loss=99.713161  time=0.358s
+Epoch 330: loss=99.866871  time=0.375s
+Epoch 331: loss=99.848196  time=0.427s
+Epoch 332: loss=100.042906  time=0.583s
+Epoch 333: loss=99.879270  time=0.395s
+Epoch 334: loss=99.832699  time=0.422s
+Epoch 335: loss=99.861558  time=0.352s
+Epoch 336: loss=99.715556  time=0.277s
+Epoch 337: loss=100.172390  time=0.356s
+Epoch 338: loss=99.972069  time=0.415s
+Epoch 339: loss=100.007666  time=0.567s
+Epoch 340: loss=99.672360  time=0.403s
+Epoch 341: loss=100.022206  time=0.336s
+Epoch 342: loss=99.926188  time=0.464s
+Epoch 343: loss=99.793275  time=0.331s
+Epoch 344: loss=99.840971  time=0.475s
+Epoch 345: loss=99.836864  time=0.422s
+Epoch 346: loss=99.926131  time=0.461s
+Epoch 347: loss=99.811864  time=0.304s
+Epoch 348: loss=99.817832  time=0.516s
+Epoch 349: loss=99.944763  time=0.294s
+Epoch 350: loss=99.861536  time=0.417s
+Epoch 351: loss=99.926702  time=0.428s
+Epoch 352: loss=99.754302  time=0.279s
+Epoch 353: loss=99.918940  time=0.560s
+Epoch 354: loss=99.915049  time=0.489s
+Epoch 355: loss=99.774797  time=0.342s
+Epoch 356: loss=99.983363  time=0.455s
+Epoch 357: loss=99.909401  time=0.410s
+Epoch 358: loss=99.984425  time=0.438s
+Epoch 359: loss=99.871570  time=0.376s
+Epoch 360: loss=99.983104  time=0.636s
+Epoch 361: loss=99.898668  time=0.449s
+Epoch 362: loss=99.850881  time=0.328s
+Epoch 363: loss=100.028035  time=0.374s
+Epoch 364: loss=99.840299  time=0.448s
+Epoch 365: loss=99.903622  time=0.337s
+Epoch 366: loss=100.053003  time=0.407s
+Epoch 367: loss=99.974144  time=0.682s
+Epoch 368: loss=100.098116  time=0.389s
+Epoch 369: loss=99.831589  time=0.517s
+Epoch 370: loss=99.882579  time=0.321s
+Epoch 371: loss=99.867380  time=0.349s
+Epoch 372: loss=99.934734  time=0.436s
+Epoch 373: loss=100.056493  time=0.395s
+Epoch 374: loss=100.118952  time=0.598s
+Epoch 375: loss=99.830949  time=0.352s
+Epoch 376: loss=99.999504  time=0.363s
+Epoch 377: loss=99.817588  time=0.369s
+Epoch 378: loss=100.082026  time=0.392s
+Epoch 379: loss=100.089803  time=0.333s
+Epoch 380: loss=99.758884  time=0.390s
+Epoch 381: loss=99.757404  time=0.643s
+Epoch 382: loss=99.778276  time=0.478s
+Epoch 383: loss=100.108362  time=0.500s
+Epoch 384: loss=99.954715  time=0.503s
+Epoch 385: loss=99.910450  time=0.455s
+Epoch 386: loss=99.817033  time=0.464s
+Epoch 387: loss=99.721293  time=0.301s
+Epoch 388: loss=99.799102  time=0.656s
+Epoch 389: loss=99.961126  time=0.339s
+Epoch 390: loss=99.966807  time=0.372s
+Epoch 391: loss=99.839071  time=0.403s
+Epoch 392: loss=99.846581  time=0.316s
+Epoch 393: loss=99.927118  time=0.362s
+Epoch 394: loss=99.878894  time=0.452s
+Epoch 395: loss=99.894467  time=0.568s
+Epoch 396: loss=99.835133  time=0.347s
+Epoch 397: loss=99.905182  time=0.453s
+Epoch 398: loss=100.027148  time=0.452s
+Epoch 399: loss=99.798259  time=0.514s
+Epoch 400: loss=99.964470  time=0.348s
+Epoch 401: loss=99.786913  time=0.411s
+Epoch 402: loss=100.005723  time=0.519s
+Epoch 403: loss=99.864672  time=0.383s
+Epoch 404: loss=99.916022  time=0.278s
+Epoch 405: loss=99.948896  time=0.367s
+Epoch 406: loss=100.021912  time=0.442s
+Epoch 407: loss=99.995642  time=0.430s
+Epoch 408: loss=99.948774  time=0.533s
+Epoch 409: loss=99.938194  time=0.663s
+Epoch 410: loss=100.023476  time=0.413s
+Epoch 411: loss=99.819855  time=0.251s
+Epoch 412: loss=99.934823  time=0.374s
+Epoch 413: loss=99.972214  time=0.328s
+Epoch 414: loss=99.872500  time=0.325s
+Epoch 415: loss=99.909046  time=0.389s
+Epoch 416: loss=99.849849  time=0.545s
+Epoch 417: loss=99.877323  time=0.458s
+Epoch 418: loss=99.921837  time=0.380s
+Epoch 419: loss=99.905011  time=0.433s
+Epoch 420: loss=99.768697  time=0.414s
+Epoch 421: loss=99.943293  time=0.476s
+Epoch 422: loss=99.887351  time=0.475s
+Epoch 423: loss=99.989604  time=0.530s
+Epoch 424: loss=99.677689  time=0.395s
+Epoch 425: loss=99.915877  time=0.302s
+Epoch 426: loss=99.835685  time=0.515s
+Epoch 427: loss=99.664054  time=0.373s
+Epoch 428: loss=100.016564  time=0.456s
+Epoch 429: loss=100.004318  time=0.339s
+Epoch 430: loss=99.941647  time=0.458s
+Epoch 431: loss=99.777246  time=0.327s
+Epoch 432: loss=99.987257  time=0.414s
+Epoch 433: loss=99.889684  time=0.333s
+Epoch 434: loss=99.951911  time=0.297s
+Epoch 435: loss=100.004227  time=0.356s
+Epoch 436: loss=99.919385  time=0.251s
+Epoch 437: loss=99.805443  time=0.422s
+Epoch 438: loss=99.923352  time=0.369s
+Epoch 439: loss=99.942831  time=0.468s
+Epoch 440: loss=99.761872  time=0.392s
+Epoch 441: loss=100.066765  time=0.375s
+Epoch 442: loss=99.675812  time=0.458s
+Epoch 443: loss=100.000510  time=0.200s
+Epoch 444: loss=99.862955  time=0.312s
+Epoch 445: loss=99.919464  time=0.319s
+Epoch 446: loss=99.918104  time=0.381s
+Epoch 447: loss=99.932573  time=0.373s
+Epoch 448: loss=99.902440  time=0.287s
+Epoch 449: loss=100.059477  time=0.321s
+Epoch 450: loss=100.137767  time=0.303s
+Epoch 451: loss=99.888692  time=0.421s
+Epoch 452: loss=99.933863  time=0.321s
+Epoch 453: loss=99.686259  time=0.232s
+Epoch 454: loss=99.937164  time=0.222s
+Epoch 455: loss=99.837599  time=0.287s
+Epoch 456: loss=99.896265  time=0.246s
+Epoch 457: loss=99.964487  time=0.289s
+Epoch 458: loss=99.894636  time=0.380s
+Epoch 459: loss=100.010304  time=0.337s
+Epoch 460: loss=99.913648  time=0.320s
+Epoch 461: loss=99.941757  time=0.484s
+Epoch 462: loss=99.796691  time=0.354s
+Epoch 463: loss=99.910077  time=0.298s
+Epoch 464: loss=99.705722  time=0.311s
+Epoch 465: loss=100.090359  time=0.504s
+Epoch 466: loss=99.987776  time=0.352s
+Epoch 467: loss=99.892083  time=0.380s
+Epoch 468: loss=99.895739  time=0.297s
+Epoch 469: loss=99.912809  time=0.383s
+Epoch 470: loss=99.797522  time=0.366s
+Epoch 471: loss=99.875902  time=0.336s
+Epoch 472: loss=99.938920  time=0.567s
+Epoch 473: loss=99.931330  time=0.252s
+Epoch 474: loss=99.910058  time=0.379s
+Epoch 475: loss=99.829328  time=0.381s
+Epoch 476: loss=99.988156  time=0.370s
+Epoch 477: loss=100.070548  time=0.261s
+Epoch 478: loss=99.757068  time=0.318s
+Epoch 479: loss=99.865849  time=0.437s
+Epoch 480: loss=99.800035  time=0.354s
+Epoch 481: loss=99.736647  time=0.382s
+Epoch 482: loss=100.017965  time=0.430s
+Epoch 483: loss=99.843749  time=0.252s
+Epoch 484: loss=99.983878  time=0.315s
+Epoch 485: loss=99.929317  time=0.487s
+Epoch 486: loss=99.802851  time=0.458s
+Epoch 487: loss=99.930181  time=0.289s
+Epoch 488: loss=99.968079  time=0.289s
+Epoch 489: loss=99.942400  time=0.276s
+Epoch 490: loss=99.997429  time=0.308s
+Epoch 491: loss=100.004282  time=0.307s
+Epoch 492: loss=99.823224  time=0.331s
+Epoch 493: loss=100.055401  time=0.535s
+Epoch 494: loss=99.904996  time=0.380s
+Epoch 495: loss=100.137447  time=0.456s
+Epoch 496: loss=100.021386  time=0.430s
+Epoch 497: loss=99.878020  time=0.289s
+Epoch 498: loss=99.820607  time=0.302s
+Epoch 499: loss=99.963557  time=0.276s
+Epoch 500: loss=99.842344  time=0.606s
+Epoch 501: loss=99.951647  time=0.303s
+Epoch 502: loss=99.927196  time=0.374s
+Epoch 503: loss=99.962373  time=0.295s
+Epoch 504: loss=99.882371  time=0.333s
+Epoch 505: loss=99.920759  time=0.278s
+Epoch 506: loss=100.111979  time=0.301s
+Epoch 507: loss=99.814312  time=0.547s
+Epoch 508: loss=100.158649  time=0.388s
+Epoch 509: loss=99.879655  time=0.274s
+Epoch 510: loss=100.077427  time=0.292s
+Epoch 511: loss=99.923231  time=0.311s
+Epoch 512: loss=99.950108  time=0.287s
+Epoch 513: loss=99.821543  time=0.450s
+Epoch 514: loss=100.045813  time=0.575s
+Epoch 515: loss=99.825144  time=0.330s
+Epoch 516: loss=99.972235  time=0.458s
+Epoch 517: loss=100.020595  time=0.442s
+Epoch 518: loss=100.051163  time=0.419s
+Epoch 519: loss=100.220523  time=0.409s
+Epoch 520: loss=99.775599  time=0.298s
+Epoch 521: loss=99.869710  time=0.570s
+Epoch 522: loss=99.997390  time=0.311s
+Epoch 523: loss=99.750054  time=0.346s
+Epoch 524: loss=99.965946  time=0.350s
+Epoch 525: loss=99.870248  time=0.261s
+Epoch 526: loss=99.891618  time=0.345s
+Epoch 527: loss=100.160336  time=0.317s
+Epoch 528: loss=99.878419  time=0.331s
+Epoch 529: loss=99.811915  time=0.167s
+Epoch 530: loss=99.965606  time=0.169s
+Epoch 531: loss=99.968793  time=0.172s
+Epoch 532: loss=99.892992  time=0.173s
+Epoch 533: loss=99.886861  time=0.188s
+Epoch 534: loss=99.976119  time=0.200s
+Epoch 535: loss=99.833356  time=0.263s
+Epoch 536: loss=99.722913  time=0.167s
+Epoch 537: loss=99.914334  time=0.169s
+Epoch 538: loss=99.854095  time=0.169s
+Epoch 539: loss=100.138750  time=0.171s
+Epoch 540: loss=99.874979  time=0.172s
+Epoch 541: loss=100.225523  time=0.211s
+Epoch 542: loss=99.863506  time=0.393s
+Epoch 543: loss=99.710366  time=0.268s
+Epoch 544: loss=99.795110  time=0.272s
+Epoch 545: loss=99.917878  time=0.311s
+Epoch 546: loss=99.870246  time=0.524s
+Epoch 547: loss=100.072849  time=0.343s
+Epoch 548: loss=99.646614  time=0.223s
+Epoch 549: loss=99.883743  time=0.500s
+Epoch 550: loss=99.844705  time=0.456s
+Epoch 551: loss=100.030929  time=0.512s
+Epoch 552: loss=99.887517  time=0.451s
+Epoch 553: loss=99.908032  time=0.293s
+Epoch 554: loss=99.861186  time=0.292s
+Epoch 555: loss=100.037017  time=0.353s
+Epoch 556: loss=99.966352  time=0.413s
+Epoch 557: loss=99.771223  time=0.417s
+Epoch 558: loss=99.898222  time=0.358s
+Epoch 559: loss=99.948389  time=0.280s
+Epoch 560: loss=100.005850  time=0.304s
+Epoch 561: loss=99.990079  time=0.279s
+Epoch 562: loss=100.027402  time=0.326s
+Epoch 563: loss=100.047462  time=0.358s
+Epoch 564: loss=99.985785  time=0.284s
+Epoch 565: loss=100.073253  time=0.325s
+Epoch 566: loss=99.983478  time=0.229s
+Epoch 567: loss=100.018454  time=0.191s
+Epoch 568: loss=99.993713  time=0.254s
+Epoch 569: loss=99.890832  time=0.214s
+Epoch 570: loss=99.778912  time=0.342s
+Epoch 571: loss=99.929538  time=0.216s
+Epoch 572: loss=99.992531  time=0.220s
+Epoch 573: loss=99.971246  time=0.298s
+Epoch 574: loss=99.930416  time=0.238s
+Epoch 575: loss=99.836624  time=0.209s
+Epoch 576: loss=100.063484  time=0.267s
+Epoch 577: loss=99.970078  time=0.395s
+Epoch 578: loss=99.853285  time=0.231s
+Epoch 579: loss=99.934966  time=0.210s
+Epoch 580: loss=99.906355  time=0.265s
+Epoch 581: loss=99.773357  time=0.336s
+Epoch 582: loss=99.894090  time=0.212s
+Epoch 583: loss=100.080274  time=0.315s
+Epoch 584: loss=99.832326  time=0.464s
+Epoch 585: loss=100.018524  time=0.293s
+Epoch 586: loss=99.950999  time=0.367s
+Epoch 587: loss=100.040015  time=0.382s
+Epoch 588: loss=99.762464  time=0.264s
+Epoch 589: loss=99.820551  time=0.264s
+Epoch 590: loss=99.908182  time=0.292s
+Epoch 591: loss=100.089947  time=0.497s
+Epoch 592: loss=99.832040  time=0.326s
+Epoch 593: loss=99.811463  time=0.298s
+Epoch 594: loss=99.700413  time=0.223s
+Epoch 595: loss=99.872123  time=0.196s
+Epoch 596: loss=99.983618  time=0.249s
+Epoch 597: loss=99.786420  time=0.191s
+Epoch 598: loss=99.986479  time=0.400s
+Epoch 599: loss=100.044548  time=0.251s
+Epoch 600: loss=99.874373  time=0.298s
+Epoch 601: loss=99.988973  time=0.368s
+Epoch 602: loss=99.923023  time=0.231s
+Epoch 603: loss=100.010598  time=0.242s
+Epoch 604: loss=100.042197  time=0.204s
+Epoch 605: loss=99.778062  time=0.437s
+Epoch 606: loss=99.984628  time=0.327s
+Epoch 607: loss=99.936780  time=0.216s
+Epoch 608: loss=99.917829  time=0.204s
+Epoch 609: loss=99.827639  time=0.198s
+Epoch 610: loss=99.942727  time=0.183s
+Epoch 611: loss=100.132079  time=0.290s
+Epoch 612: loss=100.042125  time=0.378s
+Epoch 613: loss=99.926336  time=0.197s
+Epoch 614: loss=99.801950  time=0.204s
+Epoch 615: loss=99.925961  time=0.288s
+Epoch 616: loss=99.871143  time=0.253s
+Epoch 617: loss=99.922609  time=0.285s
+Epoch 618: loss=99.823486  time=0.283s
+Epoch 619: loss=100.022581  time=0.410s
+Epoch 620: loss=100.163344  time=0.274s
+Epoch 621: loss=99.809875  time=0.401s
+Epoch 622: loss=99.873617  time=0.420s
+Epoch 623: loss=99.741774  time=0.224s
+Epoch 624: loss=99.879035  time=0.227s
+Epoch 625: loss=99.900957  time=0.217s
+Epoch 626: loss=99.886948  time=0.531s
+Epoch 627: loss=99.918384  time=0.318s
+Epoch 628: loss=99.926660  time=0.270s
+Epoch 629: loss=99.866185  time=0.288s
+Epoch 630: loss=99.814396  time=0.240s
+Epoch 631: loss=99.942104  time=0.261s
+Epoch 632: loss=99.951203  time=0.287s
+Epoch 633: loss=100.051428  time=0.467s
+Epoch 634: loss=99.929072  time=0.365s
+Epoch 635: loss=99.824907  time=0.445s
+Epoch 636: loss=99.994717  time=0.466s
+Epoch 637: loss=100.010822  time=0.218s
+Epoch 638: loss=99.913697  time=0.233s
+Epoch 639: loss=99.957095  time=0.379s
+Epoch 640: loss=99.975278  time=0.410s
+Epoch 641: loss=99.905838  time=0.237s
+Epoch 642: loss=99.848870  time=0.212s
+Epoch 643: loss=100.047688  time=0.183s
+Epoch 644: loss=100.001750  time=0.189s
+Epoch 645: loss=99.899298  time=0.228s
+Epoch 646: loss=99.774393  time=0.356s
+Epoch 647: loss=99.851601  time=0.372s
+Epoch 648: loss=99.864948  time=0.208s
+Epoch 649: loss=99.922882  time=0.271s
+Epoch 650: loss=99.944473  time=0.212s
+Epoch 651: loss=100.006642  time=0.235s
+Epoch 652: loss=100.002619  time=0.201s
+Epoch 653: loss=99.961044  time=0.189s
+Epoch 654: loss=99.768215  time=0.311s
+Epoch 655: loss=99.935814  time=0.354s
+Epoch 656: loss=100.103157  time=0.293s
+Epoch 657: loss=100.181860  time=0.279s
+Epoch 658: loss=99.763247  time=0.331s
+Epoch 659: loss=99.797860  time=0.312s
+Epoch 660: loss=99.896787  time=0.252s
+Epoch 661: loss=100.063707  time=0.456s
+Epoch 662: loss=99.955341  time=0.385s
+Epoch 663: loss=99.820897  time=0.285s
+Epoch 664: loss=99.890681  time=0.226s
+Epoch 665: loss=99.866180  time=0.178s
+Epoch 666: loss=100.039894  time=0.211s
+Epoch 667: loss=100.179031  time=0.186s
+Epoch 668: loss=99.836163  time=0.310s
+Epoch 669: loss=99.892495  time=0.332s
+Epoch 670: loss=100.036951  time=0.308s
+Epoch 671: loss=99.825831  time=0.266s
+Epoch 672: loss=99.853608  time=0.222s
+Epoch 673: loss=99.904408  time=0.283s
+Epoch 674: loss=99.896562  time=0.250s
+Epoch 675: loss=99.885792  time=0.310s
+Epoch 676: loss=99.915411  time=0.203s
+Epoch 677: loss=99.871500  time=0.207s
+Epoch 678: loss=99.977872  time=0.240s
+Epoch 679: loss=99.990367  time=0.223s
+Epoch 680: loss=99.945097  time=0.205s
+Epoch 681: loss=99.893215  time=0.347s
+Epoch 682: loss=99.968226  time=0.306s
+Epoch 683: loss=100.011406  time=0.220s
+Epoch 684: loss=99.708257  time=0.287s
+Epoch 685: loss=100.033500  time=0.336s
+Epoch 686: loss=99.814463  time=0.227s
+Epoch 687: loss=99.839693  time=0.181s
+Epoch 688: loss=99.930716  time=0.205s
+Epoch 689: loss=99.760977  time=0.312s
+Epoch 690: loss=99.980211  time=0.211s
+Epoch 691: loss=99.904927  time=0.189s
+Epoch 692: loss=99.890863  time=0.215s
+Epoch 693: loss=99.878805  time=0.340s
+Epoch 694: loss=99.899467  time=0.277s
+Epoch 695: loss=99.976277  time=0.239s
+Epoch 696: loss=100.028188  time=0.303s
+Epoch 697: loss=99.913960  time=0.195s
+Epoch 698: loss=99.857567  time=0.186s
+Epoch 699: loss=99.942648  time=0.227s
+Epoch 700: loss=100.075996  time=0.369s
+Epoch 701: loss=100.053980  time=0.325s
+Epoch 702: loss=99.838796  time=0.274s
+Epoch 703: loss=99.886960  time=0.363s
+Epoch 704: loss=100.024297  time=0.479s
+Epoch 705: loss=99.944789  time=0.230s
+Epoch 706: loss=99.750517  time=0.202s
+Epoch 707: loss=99.994852  time=0.190s
+Epoch 708: loss=99.934394  time=0.206s
+Epoch 709: loss=99.803852  time=0.217s
+Epoch 710: loss=99.705755  time=0.352s
+Epoch 711: loss=99.975944  time=0.286s
+Epoch 712: loss=99.876330  time=0.211s
+Epoch 713: loss=99.938618  time=0.242s
+Epoch 714: loss=99.843410  time=0.319s
+Epoch 715: loss=99.792900  time=0.227s
+Epoch 716: loss=99.922778  time=0.295s
+Epoch 717: loss=100.125970  time=0.355s
+Epoch 718: loss=99.907536  time=0.228s
+Epoch 719: loss=99.910434  time=0.204s
+Epoch 720: loss=99.913158  time=0.187s
+Epoch 721: loss=99.997900  time=0.196s
+Epoch 722: loss=100.149340  time=0.281s
+Epoch 723: loss=99.947597  time=0.298s
+Epoch 724: loss=99.893583  time=0.405s
+Epoch 725: loss=99.847608  time=0.228s
+Epoch 726: loss=99.909510  time=0.235s
+Epoch 727: loss=100.206552  time=0.258s
+Epoch 728: loss=99.789590  time=0.214s
+Epoch 729: loss=99.952020  time=0.253s
+Epoch 730: loss=99.974755  time=0.217s
+Epoch 731: loss=100.021255  time=0.344s
+Epoch 732: loss=99.824881  time=0.245s
+Epoch 733: loss=99.912696  time=0.235s
+Epoch 734: loss=99.942513  time=0.190s
+Epoch 735: loss=100.034182  time=0.231s
+Epoch 736: loss=99.913673  time=0.205s
+Epoch 737: loss=99.913136  time=0.211s
+Epoch 738: loss=99.975562  time=0.431s
+Epoch 739: loss=99.885797  time=0.259s
+Epoch 740: loss=99.869549  time=0.238s
+Epoch 741: loss=99.914967  time=0.291s
+Epoch 742: loss=99.906395  time=0.286s
+Epoch 743: loss=99.884657  time=0.226s
+Epoch 744: loss=99.840122  time=0.235s
+Epoch 745: loss=100.003285  time=0.305s
+Epoch 746: loss=99.885719  time=0.214s
+Epoch 747: loss=100.066550  time=0.223s
+Epoch 748: loss=99.972356  time=0.225s
+Epoch 749: loss=100.058832  time=0.228s
+Epoch 750: loss=99.759128  time=0.269s
+Epoch 751: loss=99.924385  time=0.303s
+Epoch 752: loss=100.007273  time=0.450s
+Epoch 753: loss=99.952242  time=0.265s
+Epoch 754: loss=99.919062  time=0.335s
+Epoch 755: loss=99.835618  time=0.256s
+Epoch 756: loss=99.854144  time=0.252s
+Epoch 757: loss=100.052069  time=0.272s
+Epoch 758: loss=99.730875  time=0.320s
+Epoch 759: loss=99.906032  time=0.457s
+Epoch 760: loss=99.913236  time=0.279s
+Epoch 761: loss=99.789978  time=0.209s
+Epoch 762: loss=99.896957  time=0.187s
+Epoch 763: loss=100.181837  time=0.280s
+Epoch 764: loss=99.802966  time=0.234s
+Epoch 765: loss=100.009226  time=0.194s
+Epoch 766: loss=99.955155  time=0.326s
+Epoch 767: loss=99.986745  time=0.313s
+Epoch 768: loss=99.905107  time=0.344s
+Epoch 769: loss=99.979336  time=0.286s
+Epoch 770: loss=99.946042  time=0.329s
+Epoch 771: loss=99.880121  time=0.253s
+Epoch 772: loss=100.026808  time=0.205s
+Epoch 773: loss=99.801807  time=0.406s
+Epoch 774: loss=99.792284  time=0.302s
+Epoch 775: loss=99.800736  time=0.250s
+Epoch 776: loss=99.729076  time=0.230s
+Epoch 777: loss=99.865113  time=0.263s
+Epoch 778: loss=99.866988  time=0.298s
+Epoch 779: loss=99.821562  time=0.198s
+Epoch 780: loss=99.849044  time=0.318s
+Epoch 781: loss=100.024263  time=0.278s
+Epoch 782: loss=99.854396  time=0.251s
+Epoch 783: loss=100.087610  time=0.188s
+Epoch 784: loss=99.868232  time=0.226s
+Epoch 785: loss=99.948998  time=0.222s
+Epoch 786: loss=99.923909  time=0.264s
+Epoch 787: loss=99.814641  time=0.306s
+Epoch 788: loss=99.913574  time=0.202s
+Epoch 789: loss=99.912931  time=0.195s
+Epoch 790: loss=100.015095  time=0.242s
+Epoch 791: loss=99.983652  time=0.244s
+Epoch 792: loss=99.927691  time=0.186s
+Epoch 793: loss=99.968707  time=0.181s
+Epoch 794: loss=99.942512  time=0.291s
+Epoch 795: loss=100.014556  time=0.222s
+Epoch 796: loss=99.850440  time=0.199s
+Epoch 797: loss=100.075858  time=0.202s
+Epoch 798: loss=99.896569  time=0.202s
+Epoch 799: loss=99.746333  time=0.301s
+Epoch 800: loss=99.827010  time=0.207s
+Epoch 801: loss=99.950199  time=0.186s
+Epoch 802: loss=99.924338  time=0.119s
+Epoch 803: loss=100.037795  time=0.125s
+Epoch 804: loss=99.814272  time=0.118s
+Epoch 805: loss=100.003237  time=0.125s
+Epoch 806: loss=100.141828  time=0.122s
+Epoch 807: loss=99.938912  time=0.118s
+Epoch 808: loss=100.080191  time=0.185s
+Epoch 809: loss=99.931618  time=0.116s
+Epoch 810: loss=99.806401  time=0.117s
+Epoch 811: loss=99.981237  time=0.117s
+Epoch 812: loss=99.825080  time=0.117s
+Epoch 813: loss=100.036691  time=0.121s
+Epoch 814: loss=99.895428  time=0.120s
+Epoch 815: loss=100.056132  time=0.179s
+Epoch 816: loss=100.038920  time=0.245s
+Epoch 817: loss=99.904256  time=0.157s
+Epoch 818: loss=99.933382  time=0.136s
+Epoch 819: loss=99.783225  time=0.139s
+Epoch 820: loss=99.914402  time=0.137s
+Epoch 821: loss=99.940491  time=0.133s
+Epoch 822: loss=99.836668  time=0.201s
+Epoch 823: loss=100.053468  time=0.136s
+Epoch 824: loss=100.099934  time=0.137s
+Epoch 825: loss=99.895641  time=0.153s
+Epoch 826: loss=99.750100  time=0.148s
+Epoch 827: loss=100.054301  time=0.144s
+Epoch 828: loss=99.849063  time=0.140s
+Epoch 829: loss=99.789996  time=0.207s
+Epoch 830: loss=99.972029  time=0.132s
+Epoch 831: loss=99.953374  time=0.131s
+Epoch 832: loss=100.018975  time=0.135s
+Epoch 833: loss=99.928139  time=0.128s
+Epoch 834: loss=99.840599  time=0.131s
+Epoch 835: loss=99.970525  time=0.141s
+Epoch 836: loss=99.812484  time=0.456s
+Epoch 837: loss=99.855783  time=0.337s
+Epoch 838: loss=100.202813  time=0.243s
+Epoch 839: loss=100.014512  time=0.197s
+Epoch 840: loss=99.831950  time=0.411s
+Epoch 841: loss=99.821329  time=0.383s
+Epoch 842: loss=99.775677  time=0.387s
+Epoch 843: loss=99.896388  time=0.496s
+Epoch 844: loss=100.082251  time=0.320s
+Epoch 845: loss=99.976014  time=0.498s
+Epoch 846: loss=99.967304  time=0.310s
+Epoch 847: loss=99.943758  time=0.414s
+Epoch 848: loss=99.981241  time=0.476s
+Epoch 849: loss=99.944479  time=0.359s
+Epoch 850: loss=100.053962  time=0.684s
+Epoch 851: loss=99.767010  time=0.492s
+Epoch 852: loss=99.921815  time=0.417s
+Epoch 853: loss=99.874749  time=0.453s
+Epoch 854: loss=99.959472  time=0.397s
+Epoch 855: loss=99.827428  time=0.411s
+Epoch 856: loss=99.843798  time=0.435s
+Epoch 857: loss=100.045833  time=0.579s
+Epoch 858: loss=100.003674  time=0.336s
+Epoch 859: loss=99.810966  time=0.512s
+Epoch 860: loss=99.966675  time=0.479s
+Epoch 861: loss=99.764549  time=0.416s
+Epoch 862: loss=99.774415  time=0.408s
+Epoch 863: loss=99.956266  time=0.331s
+Epoch 864: loss=99.955361  time=0.662s
+Epoch 865: loss=99.919167  time=0.436s
+Epoch 866: loss=99.962994  time=0.378s
+Epoch 867: loss=100.012226  time=0.427s
+Epoch 868: loss=99.956762  time=0.436s
+Epoch 869: loss=99.888640  time=0.414s
+Epoch 870: loss=100.117952  time=0.487s
+Epoch 871: loss=99.947714  time=0.601s
+Epoch 872: loss=99.956685  time=0.280s
+Epoch 873: loss=99.798672  time=0.486s
+Epoch 874: loss=99.895846  time=0.455s
+Epoch 875: loss=99.965033  time=0.322s
+Epoch 876: loss=99.995846  time=0.256s
+Epoch 877: loss=99.880720  time=0.390s
+Epoch 878: loss=99.898467  time=0.504s
+Epoch 879: loss=99.929488  time=0.508s
+Epoch 880: loss=99.936967  time=0.394s
+Epoch 881: loss=99.843176  time=0.453s
+Epoch 882: loss=99.691862  time=0.360s
+Epoch 883: loss=99.902805  time=0.272s
+Epoch 884: loss=100.001882  time=0.398s
+Epoch 885: loss=99.865644  time=0.492s
+Epoch 886: loss=99.962871  time=0.542s
+Epoch 887: loss=99.799178  time=0.297s
+Epoch 888: loss=100.045912  time=0.225s
+Epoch 889: loss=99.941389  time=0.369s
+Epoch 890: loss=99.830328  time=0.422s
+Epoch 891: loss=99.885428  time=0.279s
+Epoch 892: loss=100.028902  time=0.555s
+Epoch 893: loss=99.927673  time=0.245s
+Epoch 894: loss=100.059526  time=0.311s
+Epoch 895: loss=99.967260  time=0.367s
+Epoch 896: loss=99.902147  time=0.388s
+Epoch 897: loss=99.930392  time=0.306s
+Epoch 898: loss=99.925377  time=0.304s
+Epoch 899: loss=99.925893  time=0.503s
+Epoch 900: loss=99.882961  time=0.335s
+Epoch 901: loss=100.036855  time=0.546s
+Epoch 902: loss=99.915751  time=0.352s
+Epoch 903: loss=99.931745  time=0.493s
+Epoch 904: loss=99.891606  time=0.364s
+Epoch 905: loss=99.922130  time=0.463s
+Epoch 906: loss=100.136004  time=0.550s
+Epoch 907: loss=99.855371  time=0.428s
+Epoch 908: loss=100.058941  time=0.376s
+Epoch 909: loss=99.742326  time=0.293s
+Epoch 910: loss=100.040520  time=0.397s
+Epoch 911: loss=99.733506  time=0.291s
+Epoch 912: loss=99.742741  time=0.325s
+Epoch 913: loss=100.069442  time=0.576s
+Epoch 914: loss=99.767788  time=0.458s
+Epoch 915: loss=99.951851  time=0.205s
+Epoch 916: loss=100.073694  time=0.272s
+Epoch 917: loss=99.942494  time=0.367s
+Epoch 918: loss=99.775905  time=0.237s
+Epoch 919: loss=99.906420  time=0.335s
+Epoch 920: loss=99.982217  time=0.496s
+Epoch 921: loss=100.070522  time=0.360s
+Epoch 922: loss=99.813437  time=0.364s
+Epoch 923: loss=99.912134  time=0.247s
+Epoch 924: loss=99.821439  time=0.284s
+Epoch 925: loss=99.815948  time=0.338s
+Epoch 926: loss=99.926471  time=0.496s
+Epoch 927: loss=99.886424  time=0.544s
+Epoch 928: loss=100.086235  time=0.335s
+Epoch 929: loss=99.957706  time=0.364s
+Epoch 930: loss=99.923567  time=0.411s
+Epoch 931: loss=99.865875  time=0.319s
+Epoch 932: loss=100.062295  time=0.393s
+Epoch 933: loss=99.820364  time=0.252s
+Epoch 934: loss=99.947522  time=0.524s
+Epoch 935: loss=100.051954  time=0.467s
+Epoch 936: loss=99.769305  time=0.403s
+Epoch 937: loss=99.827737  time=0.352s
+Epoch 938: loss=99.901292  time=0.312s
+Epoch 939: loss=100.092182  time=0.287s
+Epoch 940: loss=99.867468  time=0.257s
+Epoch 941: loss=99.969968  time=0.499s
+Epoch 942: loss=99.975279  time=0.309s
+Epoch 943: loss=100.015288  time=0.323s
+Epoch 944: loss=99.873273  time=0.332s
+Epoch 945: loss=99.835645  time=0.313s
+Epoch 946: loss=100.109710  time=0.305s
+Epoch 947: loss=100.068649  time=0.315s
+Epoch 948: loss=99.892449  time=0.584s
+Epoch 949: loss=100.009259  time=0.345s
+Epoch 950: loss=100.115505  time=0.357s
+Epoch 951: loss=100.168803  time=0.309s
+Epoch 952: loss=100.127425  time=0.399s
+Epoch 953: loss=99.791953  time=0.433s
+Epoch 954: loss=99.991654  time=0.430s
+Epoch 955: loss=99.790025  time=0.451s
+Epoch 956: loss=99.990627  time=0.379s
+Epoch 957: loss=99.935237  time=0.279s
+Epoch 958: loss=99.733030  time=0.370s
+Epoch 959: loss=100.120753  time=0.353s
+Epoch 960: loss=100.008016  time=0.276s
+Epoch 961: loss=99.927512  time=0.383s
+Epoch 962: loss=99.818294  time=0.602s
+Epoch 963: loss=99.785834  time=0.403s
+Epoch 964: loss=99.737211  time=0.410s
+Epoch 965: loss=99.937949  time=0.373s
+Epoch 966: loss=99.705822  time=0.319s
+Epoch 967: loss=99.799362  time=0.402s
+Epoch 968: loss=99.809488  time=0.437s
+Epoch 969: loss=99.856070  time=0.547s
+Epoch 970: loss=99.912323  time=0.483s
+Epoch 971: loss=99.909731  time=0.371s
+Epoch 972: loss=99.782947  time=0.381s
+Epoch 973: loss=99.800544  time=0.475s
+Epoch 974: loss=100.015067  time=0.440s
+Epoch 975: loss=99.941091  time=0.387s
+Epoch 976: loss=99.880338  time=0.487s
+Epoch 977: loss=99.875873  time=0.440s
+Epoch 978: loss=100.191866  time=0.440s
+Epoch 979: loss=99.904145  time=0.384s
+Epoch 980: loss=99.885263  time=0.444s
+Epoch 981: loss=99.984123  time=0.425s
+Epoch 982: loss=99.955111  time=0.470s
+Epoch 983: loss=99.807502  time=0.551s
+Epoch 984: loss=99.709392  time=0.410s
+Epoch 985: loss=99.845028  time=0.306s
+Epoch 986: loss=99.855742  time=0.381s
+Epoch 987: loss=99.884838  time=0.420s
+Epoch 988: loss=99.876808  time=0.369s
+Epoch 989: loss=99.699896  time=0.378s
+Epoch 990: loss=99.877006  time=0.462s
+Epoch 991: loss=99.857332  time=0.281s
+Epoch 992: loss=99.889484  time=0.401s
+Epoch 993: loss=100.005688  time=0.422s
+Epoch 994: loss=99.883045  time=0.381s
+Epoch 995: loss=100.195025  time=0.422s
+Epoch 996: loss=100.152740  time=0.393s
+Epoch 997: loss=99.987025  time=0.547s
+Epoch 998: loss=100.029273  time=0.406s
+Epoch 999: loss=99.802663  time=0.359s
+Epoch 1000: loss=100.118423  time=0.397s
+Saved model state to: out_reg_csv\torch_linear_model.pth
+
+=== Final evaluation on test set ===
+MSE  : 99.259163
+RMSE : 9.962889
+R^2  : 0.997294
+Saved prediction preview to: out_reg_csv\predictions_preview.csv
+Saved training history (epoch loss/time) to: out_reg_csv\training_history.csv
+
+Sample predictions (first 10 rows of preview):
+row 0: feature_1=7.538, feature_2=7.393, feature_3=4.433, feature_4=24.570, feature_5=9.966, feature_6=28.925  | true=158.589  pred=144.422
+row 1: feature_1=18.290, feature_2=25.257, feature_3=71.727, feature_4=37.588, feature_5=68.748, feature_6=51.411  | true=537.272  pred=525.064
+row 2: feature_1=26.670, feature_2=56.769, feature_3=56.638, feature_4=8.373, feature_5=53.942, feature_6=96.438  | true=442.052  pred=451.287
+row 3: feature_1=40.952, feature_2=80.125, feature_3=13.191, feature_4=96.280, feature_5=36.154, feature_6=50.483  | true=254.637  pred=268.612
+row 4: feature_1=63.226, feature_2=70.936, feature_3=45.502, feature_4=5.183, feature_5=87.365, feature_6=12.930  | true=334.019  pred=320.252
+row 5: feature_1=27.035, feature_2=17.153, feature_3=9.890, feature_4=15.613, feature_5=55.215, feature_6=93.758  | true=355.329  pred=377.669
+row 6: feature_1=95.300, feature_2=75.746, feature_3=67.511, feature_4=87.438, feature_5=21.725, feature_6=34.917  | true=642.151  pred=627.544
+row 7: feature_1=61.773, feature_2=72.300, feature_3=0.739, feature_4=35.220, feature_5=2.643, feature_6=56.075  | true=196.044  pred=204.532
+row 8: feature_1=36.548, feature_2=34.382, feature_3=27.931, feature_4=32.073, feature_5=13.968, feature_6=1.292  | true=234.001  pred=214.695
+row 9: feature_1=80.072, feature_2=87.722, feature_3=32.387, feature_4=95.299, feature_5=49.366, feature_6=87.240  | true=534.861  pred=552.648
+
+Artifacts saved in: out_reg_csv
+ - model state: out_reg_csv\torch_linear_model.pth
+ - scaler: out_reg_csv\scaler.pkl
+ - predictions preview: out_reg_csv\predictions_preview.csv
+ - training history: out_reg_csv\training_history.csv
+(venv) (base) PS C:\Users\aswin\Desktop\csai\regression> self.linear = nn.Linear(n_features, 1)
+At line:1 char:35
++ self.linear = nn.Linear(n_features, 1)
++                                   ~
+Missing argument in parameter list.
+    + CategoryInfo          : ParserError: (:) [], ParentContainsErrorRecordException
+    + FullyQualifiedErrorId : MissingArgument
+
+(venv) (base) PS C:\Users\aswin\Desktop\csai\regression> Start-Process notepad.exe train_from_csv.py
+(venv) (base) PS C:\Users\aswin\Desktop\csai\regression> code train_from_csv.py
+(venv) (base) PS C:\Users\aswin\Desktop\csai\regression> .\venv\Scripts\python.exe train_from_csv.py --csv train_data.csv --target target --epochs 300 --batch-size 512 --lr 0.001
+Loading CSV dataset...
+Loaded dataset with 38000 samples and 6 features.
+Feature columns: ['feature_1', 'feature_2', 'feature_3', 'feature_4', 'feature_5', 'feature_6']
+Train samples: 30400, Test samples: 7600
+Saved scaler to: out_reg_csv\scaler.pkl
+Using device: cpu
+
+Starting training...
+Epoch 001: loss=1092803.118750  time=0.839s
+Epoch 002: loss=205952.302865  time=1.705s
+Epoch 003: loss=170234.376042  time=0.877s
+Epoch 004: loss=141955.811198  time=0.789s
+Epoch 005: loss=119467.371745  time=0.799s
+Epoch 006: loss=101990.730729  time=0.862s
+Epoch 007: loss=88286.612891  time=0.781s
+Epoch 008: loss=77343.300651  time=0.823s
+Epoch 009: loss=68817.591992  time=0.999s
+Epoch 010: loss=62228.675521  time=0.826s
+Epoch 011: loss=56866.870052  time=0.907s
+Epoch 012: loss=52816.900651  time=1.081s
+Epoch 013: loss=49436.860156  time=0.927s
+Epoch 014: loss=46940.589388  time=0.800s
+Epoch 015: loss=44930.073177  time=0.801s
+Epoch 016: loss=43319.814583  time=0.784s
+Epoch 017: loss=42077.783724  time=1.115s
+Epoch 018: loss=41059.296615  time=0.843s
+Epoch 019: loss=40297.189909  time=0.798s
+Epoch 020: loss=39815.559180  time=0.790s
+Epoch 021: loss=39330.146745  time=0.792s
+Epoch 022: loss=38900.939063  time=0.894s
+Epoch 023: loss=38594.554232  time=0.755s
+Epoch 024: loss=38368.466764  time=0.970s
+Epoch 025: loss=38244.971549  time=0.872s
+Epoch 026: loss=38079.634180  time=0.892s
+Epoch 027: loss=37915.980404  time=0.796s
+Epoch 028: loss=37795.594108  time=0.772s
+Epoch 029: loss=37742.261198  time=0.846s
+Epoch 030: loss=37687.175684  time=0.778s
+Epoch 031: loss=37652.933040  time=0.969s
+Epoch 032: loss=37619.607161  time=0.860s
+Epoch 033: loss=37565.736328  time=0.791s
+Epoch 034: loss=37552.938802  time=0.808s
+Epoch 035: loss=37562.237240  time=0.800s
+Epoch 036: loss=37514.006120  time=0.882s
+Epoch 037: loss=37537.754069  time=0.824s
+Epoch 038: loss=37552.017318  time=0.673s
+Epoch 039: loss=37526.171680  time=0.463s
+Epoch 040: loss=37550.045312  time=0.446s
+Epoch 041: loss=37477.335482  time=0.361s
+Epoch 042: loss=37502.928060  time=0.394s
+Epoch 043: loss=37447.258496  time=0.414s
+Epoch 044: loss=37480.958236  time=0.275s
+Epoch 045: loss=37433.142936  time=0.383s
+Epoch 046: loss=37519.061719  time=0.261s
+Epoch 047: loss=37554.362240  time=0.347s
+Epoch 048: loss=37465.140592  time=0.295s
+Epoch 049: loss=37501.110156  time=0.269s
+Epoch 050: loss=37516.245443  time=0.285s
+Epoch 051: loss=37554.835938  time=0.286s
+Epoch 052: loss=37479.902148  time=0.391s
+Epoch 053: loss=37456.718262  time=0.289s
+Epoch 054: loss=37495.412500  time=0.325s
+Epoch 055: loss=37459.565658  time=0.331s
+Epoch 056: loss=37526.064974  time=0.249s
+Epoch 057: loss=37517.082031  time=0.257s
+Epoch 058: loss=37466.300195  time=0.273s
+Epoch 059: loss=37536.782487  time=0.392s
+Epoch 060: loss=37530.469661  time=0.309s
+Epoch 061: loss=37542.797363  time=0.323s
+Epoch 062: loss=37571.327799  time=0.318s
+Epoch 063: loss=37535.111849  time=0.251s
+Epoch 064: loss=37484.481250  time=0.251s
+Epoch 065: loss=37475.487044  time=0.264s
+Epoch 066: loss=37526.251628  time=0.431s
+Epoch 067: loss=37478.264616  time=0.334s
+Epoch 068: loss=37424.526465  time=0.307s
+Epoch 069: loss=37568.359440  time=0.262s
+Epoch 070: loss=37517.287044  time=0.301s
+Epoch 071: loss=37499.572266  time=0.300s
+Epoch 072: loss=37466.283691  time=0.335s
+Epoch 073: loss=37501.703385  time=0.400s
+Epoch 074: loss=37504.786068  time=0.310s
+Epoch 075: loss=37455.390820  time=0.274s
+Epoch 076: loss=37483.811003  time=0.283s
+Epoch 077: loss=37512.930208  time=0.302s
+Epoch 078: loss=37507.015104  time=0.323s
+Epoch 079: loss=37513.308919  time=0.279s
+Epoch 080: loss=37451.018132  time=0.396s
+Epoch 081: loss=37546.408268  time=0.322s
+Epoch 082: loss=37453.732585  time=0.299s
+Epoch 083: loss=37554.077409  time=0.268s
+Epoch 084: loss=37488.233789  time=0.293s
+Epoch 085: loss=37485.053906  time=0.270s
+Epoch 086: loss=37466.660742  time=0.263s
+Epoch 087: loss=37463.468001  time=0.357s
+Epoch 088: loss=37489.872884  time=0.296s
+Epoch 089: loss=37464.803255  time=0.260s
+Epoch 090: loss=37517.540299  time=0.277s
+Epoch 091: loss=37494.949805  time=0.305s
+Epoch 092: loss=37544.808464  time=0.328s
+Epoch 093: loss=37532.273698  time=0.298s
+Epoch 094: loss=37505.871484  time=0.437s
+Epoch 095: loss=37562.781966  time=0.351s
+Epoch 096: loss=37446.712598  time=0.279s
+Epoch 097: loss=37450.613704  time=0.296s
+Epoch 098: loss=37450.224316  time=0.332s
+Epoch 099: loss=37481.260026  time=0.327s
+Epoch 100: loss=37525.149544  time=0.287s
+Epoch 101: loss=37530.011165  time=0.439s
+Epoch 102: loss=37490.651139  time=0.344s
+Epoch 103: loss=37501.264518  time=0.255s
+Epoch 104: loss=37449.578027  time=0.264s
+Epoch 105: loss=37466.296615  time=0.282s
+Epoch 106: loss=37488.933789  time=0.254s
+Epoch 107: loss=37521.739453  time=0.265s
+Epoch 108: loss=37516.164355  time=0.414s
+Epoch 109: loss=37504.329492  time=0.249s
+Epoch 110: loss=37529.502962  time=0.258s
+Epoch 111: loss=37549.007096  time=0.254s
+Epoch 112: loss=37531.616602  time=0.256s
+Epoch 113: loss=37604.037044  time=0.262s
+Epoch 114: loss=37521.722754  time=0.255s
+Epoch 115: loss=37507.770247  time=0.493s
+Epoch 116: loss=37574.533919  time=0.283s
+Epoch 117: loss=37473.365951  time=0.310s
+Epoch 118: loss=37467.211426  time=0.374s
+Epoch 119: loss=37544.682813  time=0.362s
+Epoch 120: loss=37577.766471  time=0.504s
+Epoch 121: loss=37544.026888  time=0.285s
+Epoch 122: loss=37576.239258  time=0.497s
+Epoch 123: loss=37515.203385  time=0.344s
+Epoch 124: loss=37455.820638  time=0.443s
+Epoch 125: loss=37502.604427  time=0.370s
+Epoch 126: loss=37519.774479  time=0.387s
+Epoch 127: loss=37483.847624  time=0.277s
+Epoch 128: loss=37486.422591  time=0.293s
+Epoch 129: loss=37532.279427  time=0.468s
+Epoch 130: loss=37502.419694  time=0.397s
+Epoch 131: loss=37470.668066  time=0.274s
+Epoch 132: loss=37535.684961  time=0.288s
+Epoch 133: loss=37483.576888  time=0.268s
+Epoch 134: loss=37510.492448  time=0.294s
+Epoch 135: loss=37560.252051  time=0.262s
+Epoch 136: loss=37512.811458  time=0.358s
+Epoch 137: loss=37498.224023  time=0.255s
+Epoch 138: loss=37484.327734  time=0.240s
+Epoch 139: loss=37592.906217  time=0.297s
+Epoch 140: loss=37522.535156  time=0.273s
+Epoch 141: loss=37498.919824  time=0.257s
+Epoch 142: loss=37507.130859  time=0.275s
+Epoch 143: loss=37487.285547  time=0.364s
+Epoch 144: loss=37524.265332  time=0.255s
+Epoch 145: loss=37493.130599  time=0.249s
+Epoch 146: loss=37565.550456  time=0.292s
+Epoch 147: loss=37498.760547  time=0.419s
+Epoch 148: loss=37503.445736  time=0.314s
+Epoch 149: loss=37545.633724  time=0.286s
+Epoch 150: loss=37531.812174  time=0.708s
+Epoch 151: loss=37455.391862  time=0.369s
+Epoch 152: loss=37539.696029  time=0.552s
+Epoch 153: loss=37578.848503  time=0.735s
+Epoch 154: loss=37520.915625  time=0.528s
+Epoch 155: loss=37444.138249  time=0.233s
+Epoch 156: loss=37557.892122  time=0.326s
+Epoch 157: loss=37491.689779  time=0.340s
+Epoch 158: loss=37492.040430  time=0.269s
+Epoch 159: loss=37516.508040  time=0.256s
+Epoch 160: loss=37493.079492  time=0.256s
+Epoch 161: loss=37462.954557  time=0.257s
+Epoch 162: loss=37496.307161  time=0.266s
+Epoch 163: loss=37548.333724  time=0.768s
+Epoch 164: loss=37504.874609  time=0.987s
+Epoch 165: loss=37479.622526  time=0.833s
+Epoch 166: loss=37444.499447  time=0.845s
+Epoch 167: loss=37507.074154  time=0.889s
+Epoch 168: loss=37524.726660  time=0.916s
+Epoch 169: loss=37472.551921  time=0.799s
+Epoch 170: loss=37530.402148  time=0.788s
+Epoch 171: loss=37417.284928  time=0.999s
+Epoch 172: loss=37569.659115  time=0.728s
+Epoch 173: loss=37494.822526  time=0.753s
+Epoch 174: loss=37467.346094  time=0.855s
+Epoch 175: loss=37549.066797  time=1.016s
+Epoch 176: loss=37469.151888  time=1.025s
+Epoch 177: loss=37502.358073  time=0.856s
+Epoch 178: loss=37518.592122  time=0.857s
+Epoch 179: loss=37478.917578  time=0.828s
+Epoch 180: loss=37494.563346  time=0.840s
+Epoch 181: loss=37497.876074  time=0.880s
+Epoch 182: loss=37503.322624  time=0.782s
+Epoch 183: loss=37471.811719  time=0.820s
+Epoch 184: loss=37493.566927  time=0.858s
+Epoch 185: loss=37496.282292  time=1.068s
+Epoch 186: loss=37493.429492  time=0.875s
+Epoch 187: loss=37448.152181  time=0.887s
+Epoch 188: loss=37511.185417  time=0.883s
+Epoch 189: loss=37523.382780  time=0.911s
+Epoch 190: loss=37553.355697  time=0.829s
+Epoch 191: loss=37522.369629  time=0.753s
+Epoch 192: loss=37515.524251  time=0.997s
+Epoch 193: loss=37541.845605  time=0.777s
+Epoch 194: loss=37543.126953  time=0.864s
+Epoch 195: loss=37473.836393  time=0.833s
+Epoch 196: loss=37488.893164  time=0.876s
+Epoch 197: loss=37548.753125  time=0.865s
+Epoch 198: loss=37466.489323  time=0.812s
+Epoch 199: loss=37564.867057  time=1.025s
+Epoch 200: loss=37484.859538  time=0.939s
+Epoch 201: loss=37511.999740  time=0.895s
+Epoch 202: loss=37521.832520  time=1.159s
+Epoch 203: loss=37537.102962  time=1.155s
+Epoch 204: loss=37503.805990  time=1.407s
+Epoch 205: loss=37565.024740  time=1.183s
+Epoch 206: loss=37475.241862  time=1.379s
+Epoch 207: loss=37494.849805  time=1.115s
+Epoch 208: loss=37563.211849  time=0.499s
+Epoch 209: loss=37493.151432  time=0.288s
+Epoch 210: loss=37438.973112  time=0.356s
+Epoch 211: loss=37490.410937  time=0.292s
+Epoch 212: loss=37517.818132  time=0.271s
+Epoch 213: loss=37527.224837  time=0.408s
+Epoch 214: loss=37525.930697  time=0.304s
+Epoch 215: loss=37540.154883  time=0.346s
+Epoch 216: loss=37458.745898  time=0.379s
+Epoch 217: loss=37509.874870  time=0.394s
+Epoch 218: loss=37535.761003  time=0.487s
+Epoch 219: loss=37547.692839  time=0.425s
+Epoch 220: loss=37461.246842  time=0.535s
+Epoch 221: loss=37562.970345  time=0.585s
+Epoch 222: loss=37471.768880  time=0.573s
+Epoch 223: loss=37455.068229  time=0.480s
+Epoch 224: loss=37532.843327  time=0.423s
+Epoch 225: loss=37560.586458  time=0.668s
+Epoch 226: loss=37458.475586  time=0.602s
+Epoch 227: loss=37457.355664  time=0.603s
+Epoch 228: loss=37549.525456  time=0.673s
+Epoch 229: loss=37508.058789  time=0.475s
+Epoch 230: loss=37438.610645  time=0.443s
+Epoch 231: loss=37523.253060  time=0.414s
+Epoch 232: loss=37508.971224  time=0.576s
+Epoch 233: loss=37487.005013  time=0.573s
+Epoch 234: loss=37541.072624  time=0.701s
+Epoch 235: loss=37441.250326  time=0.497s
+Epoch 236: loss=37588.796126  time=0.612s
+Epoch 237: loss=37523.170768  time=0.556s
+Epoch 238: loss=37475.725000  time=0.528s
+Epoch 239: loss=37517.682878  time=0.623s
+Epoch 240: loss=37521.687956  time=0.533s
+Epoch 241: loss=37515.011849  time=0.474s
+Epoch 242: loss=37484.974349  time=0.483s
+Epoch 243: loss=37498.532943  time=0.597s
+Epoch 244: loss=37457.707975  time=0.475s
+Epoch 245: loss=37503.010189  time=0.327s
+Epoch 246: loss=37475.227409  time=0.329s
+Epoch 247: loss=37552.030599  time=0.544s
+Epoch 248: loss=37509.356673  time=0.770s
+Epoch 249: loss=37523.463021  time=0.347s
+Epoch 250: loss=37524.637760  time=0.461s
+Epoch 251: loss=37505.014714  time=0.534s
+Epoch 252: loss=37456.528451  time=0.305s
+Epoch 253: loss=37471.552214  time=0.305s
+Epoch 254: loss=37536.183268  time=0.286s
+Epoch 255: loss=37477.622201  time=0.372s
+Epoch 256: loss=37486.349186  time=0.288s
+Epoch 257: loss=37521.451400  time=0.291s
+Epoch 258: loss=37542.282910  time=0.349s
+Epoch 259: loss=37446.448763  time=0.406s
+Epoch 260: loss=37476.923047  time=0.412s
+Epoch 261: loss=37499.937305  time=0.398s
+Epoch 262: loss=37475.609831  time=0.603s
+Epoch 263: loss=37511.990820  time=0.555s
+Epoch 264: loss=37510.943750  time=0.539s
+Epoch 265: loss=37522.881641  time=0.433s
+Epoch 266: loss=37500.753158  time=0.654s
+Epoch 267: loss=37483.308398  time=0.593s
+Epoch 268: loss=37546.476562  time=0.495s
+Epoch 269: loss=37447.535905  time=0.512s
+Epoch 270: loss=37512.386198  time=0.661s
+Epoch 271: loss=37458.857617  time=0.613s
+Epoch 272: loss=37537.609701  time=0.536s
+Epoch 273: loss=37498.347168  time=0.576s
+Epoch 274: loss=37475.534961  time=0.643s
+Epoch 275: loss=37478.409310  time=0.524s
+Epoch 276: loss=37490.186165  time=0.835s
+Epoch 277: loss=37499.590104  time=0.513s
+Epoch 278: loss=37510.576432  time=0.509s
+Epoch 279: loss=37522.373470  time=0.549s
+Epoch 280: loss=37445.502181  time=0.628s
+Epoch 281: loss=37474.323079  time=0.577s
+Epoch 282: loss=37487.839323  time=0.531s
+Epoch 283: loss=37493.625000  time=0.869s
+Epoch 284: loss=37512.829036  time=0.580s
+Epoch 285: loss=37570.438281  time=0.472s
+Epoch 286: loss=37552.302799  time=0.610s
+Epoch 287: loss=37514.430469  time=0.673s
+Epoch 288: loss=37453.898633  time=0.561s
+Epoch 289: loss=37532.036133  time=0.656s
+Epoch 290: loss=37498.129036  time=0.753s
+Epoch 291: loss=37525.539453  time=0.472s
+Epoch 292: loss=37581.836589  time=0.554s
+Epoch 293: loss=37464.593685  time=0.559s
+Epoch 294: loss=37463.821549  time=0.584s
+Epoch 295: loss=37496.890625  time=0.465s
+Epoch 296: loss=37499.223633  time=0.659s
+Epoch 297: loss=37510.590234  time=0.807s
+Epoch 298: loss=37507.888607  time=0.546s
+Epoch 299: loss=37484.213770  time=0.619s
+Epoch 300: loss=37499.676302  time=0.666s
+Saved model state to: out_reg_csv\torch_linear_model.pth
+
+=== Final evaluation on test set ===
+MSE  : 36688.277344
+RMSE : 191.541842
+R^2  : -0.000049
+Saved prediction preview to: out_reg_csv\predictions_preview.csv
+Saved training history (epoch loss/time) to: out_reg_csv\training_history.csv
+
+Sample predictions (first 10 rows of preview):
+row 0: feature_1=7.538, feature_2=7.393, feature_3=4.433, feature_4=24.570, feature_5=9.966, feature_6=28.925  | true=158.589  pred=476.051
+row 1: feature_1=18.290, feature_2=25.257, feature_3=71.727, feature_4=37.588, feature_5=68.748, feature_6=51.411  | true=537.272  pred=476.051
+row 2: feature_1=26.670, feature_2=56.769, feature_3=56.638, feature_4=8.373, feature_5=53.942, feature_6=96.438  | true=442.052  pred=476.051
+row 3: feature_1=40.952, feature_2=80.125, feature_3=13.191, feature_4=96.280, feature_5=36.154, feature_6=50.483  | true=254.637  pred=476.051
+row 4: feature_1=63.226, feature_2=70.936, feature_3=45.502, feature_4=5.183, feature_5=87.365, feature_6=12.930  | true=334.019  pred=476.051
+row 5: feature_1=27.035, feature_2=17.153, feature_3=9.890, feature_4=15.613, feature_5=55.215, feature_6=93.758  | true=355.329  pred=476.051
+row 6: feature_1=95.300, feature_2=75.746, feature_3=67.511, feature_4=87.438, feature_5=21.725, feature_6=34.917  | true=642.151  pred=476.051
+row 7: feature_1=61.773, feature_2=72.300, feature_3=0.739, feature_4=35.220, feature_5=2.643, feature_6=56.075  | true=196.044  pred=476.051
+row 8: feature_1=36.548, feature_2=34.382, feature_3=27.931, feature_4=32.073, feature_5=13.968, feature_6=1.292  | true=234.001  pred=476.051
+row 9: feature_1=80.072, feature_2=87.722, feature_3=32.387, feature_4=95.299, feature_5=49.366, feature_6=87.240  | true=534.861  pred=476.051
+
+Artifacts saved in: out_reg_csv
+ - model state: out_reg_csv\torch_linear_model.pth
+ - scaler: out_reg_csv\scaler.pkl
+ - predictions preview: out_reg_csv\predictions_preview.csv
+ - training history: out_reg_csv\training_history.csv
+(venv) (base) PS C:\Users\aswin\Desktop\csai\regression> .\venv\Scripts\python.exe train_from_csv.py --csv train_data.csv --target target --epochs 1000 --batch-size 512 --lr 0.0005
+Loading CSV dataset...
+Loaded dataset with 38000 samples and 6 features.
+Feature columns: ['feature_1', 'feature_2', 'feature_3', 'feature_4', 'feature_5', 'feature_6']
+Train samples: 30400, Test samples: 7600
+Saved scaler to: out_reg_csv\scaler.pkl
+Using device: cpu
+
+Starting training...
+Epoch 001: loss=298699.946631  time=0.924s
+Epoch 002: loss=14372.769531  time=1.275s
+Epoch 003: loss=18197.805900  time=0.871s
+Epoch 004: loss=15139.317171  time=0.935s
+Epoch 005: loss=12377.073966  time=0.944s
+Epoch 006: loss=12541.198641  time=1.043s
+Epoch 007: loss=15830.564225  time=0.922s
+Epoch 008: loss=12603.093799  time=0.910s
+Epoch 009: loss=11890.603377  time=1.162s
+Epoch 010: loss=11104.184562  time=1.039s
+Epoch 011: loss=10425.645386  time=0.925s
+Epoch 012: loss=10051.376383  time=1.021s
+Epoch 013: loss=9894.389237  time=1.085s
+Epoch 014: loss=9420.609998  time=1.226s
+Epoch 015: loss=12237.151457  time=0.987s
+Epoch 016: loss=9792.287012  time=1.066s
+Epoch 017: loss=10022.466024  time=1.378s
+Epoch 018: loss=10597.402104  time=0.908s
+Epoch 019: loss=7998.822266  time=0.349s
+Epoch 020: loss=8167.923576  time=0.313s
+Epoch 021: loss=7963.454606  time=0.310s
+Epoch 022: loss=7801.928040  time=0.345s
+Epoch 023: loss=7728.861991  time=0.415s
+Epoch 024: loss=7349.085856  time=0.762s
+Epoch 025: loss=7983.017033  time=0.719s
+Epoch 026: loss=8122.696391  time=0.388s
+Epoch 027: loss=8233.737577  time=0.561s
+Epoch 028: loss=8057.675545  time=0.756s
+Epoch 029: loss=7751.357308  time=0.507s
+Epoch 030: loss=7147.981722  time=0.378s
+Epoch 031: loss=8976.419592  time=0.757s
+Epoch 032: loss=9175.697042  time=0.661s
+Epoch 033: loss=7621.198612  time=0.502s
+Epoch 034: loss=9682.626302  time=0.612s
+Epoch 035: loss=7131.170414  time=0.683s
+Epoch 036: loss=6708.809802  time=0.509s
+Epoch 037: loss=6641.627018  time=0.454s
+Epoch 038: loss=9700.642822  time=0.763s
+Epoch 039: loss=9041.614351  time=0.589s
+Epoch 040: loss=11792.272766  time=0.450s
+Epoch 041: loss=8002.250435  time=0.390s
+Epoch 042: loss=9366.946806  time=0.396s
+Epoch 043: loss=7955.862093  time=0.453s
+Epoch 044: loss=12210.796883  time=0.397s
+Epoch 045: loss=18273.605599  time=0.491s
+Epoch 046: loss=12132.623047  time=0.380s
+Epoch 047: loss=11745.547152  time=0.399s
+Epoch 048: loss=11176.180607  time=0.375s
+Epoch 049: loss=10887.167155  time=0.394s
+Epoch 050: loss=10454.792952  time=0.528s
+Epoch 051: loss=10370.483032  time=0.553s
+Epoch 052: loss=10096.801538  time=0.525s
+Epoch 053: loss=10055.634635  time=0.607s
+Epoch 054: loss=9970.486108  time=0.600s
+Epoch 055: loss=10212.379419  time=0.681s
+Epoch 056: loss=9475.167708  time=0.362s
+Epoch 057: loss=9818.113631  time=0.678s
+Epoch 058: loss=9009.396004  time=0.864s
+Epoch 059: loss=8103.577616  time=0.709s
+Epoch 060: loss=8167.644397  time=0.502s
+Epoch 061: loss=7017.933866  time=0.530s
+Epoch 062: loss=7722.648267  time=0.599s
+Epoch 063: loss=7099.443660  time=0.450s
+Epoch 064: loss=6947.614575  time=0.449s
+Epoch 065: loss=6452.036340  time=0.668s
+Epoch 066: loss=7057.148010  time=0.779s
+Epoch 067: loss=6341.970276  time=0.675s
+Epoch 068: loss=6122.363090  time=0.683s
+Epoch 069: loss=5774.355164  time=0.468s
+Epoch 070: loss=6038.064128  time=0.493s
+Epoch 071: loss=6312.547595  time=0.619s
+Epoch 072: loss=5948.984698  time=0.674s
+Epoch 073: loss=6219.155636  time=0.557s
+Epoch 074: loss=7476.114677  time=0.506s
+Epoch 075: loss=7854.482735  time=0.604s
+Epoch 076: loss=6398.872500  time=0.572s
+Epoch 077: loss=5818.151701  time=0.539s
+Epoch 078: loss=6459.745280  time=0.638s
+Epoch 079: loss=6253.640212  time=0.655s
+Epoch 080: loss=6068.408380  time=0.614s
+Epoch 081: loss=9730.721920  time=0.458s
+Epoch 082: loss=8303.816398  time=0.584s
+Epoch 083: loss=10004.167818  time=0.494s
+Epoch 084: loss=6770.408659  time=0.475s
+Epoch 085: loss=7443.091018  time=0.555s
+Epoch 086: loss=6333.816254  time=0.626s
+Epoch 087: loss=6127.702370  time=0.642s
+Epoch 088: loss=7047.364528  time=0.606s
+Epoch 089: loss=5322.576056  time=0.568s
+Epoch 090: loss=5703.660502  time=0.545s
+Epoch 091: loss=6285.311365  time=0.503s
+Epoch 092: loss=6525.837191  time=0.564s
+Epoch 093: loss=8323.632674  time=0.639s
+Epoch 094: loss=7382.570797  time=0.633s
+Epoch 095: loss=6017.786755  time=0.537s
+Epoch 096: loss=6569.078764  time=0.723s
+Epoch 097: loss=6604.637508  time=0.619s
+Epoch 098: loss=5437.554960  time=0.604s
+Epoch 099: loss=5522.511747  time=0.633s
+Epoch 100: loss=5723.579635  time=0.526s
+Epoch 101: loss=5690.732438  time=0.660s
+Epoch 102: loss=5313.282491  time=0.612s
+Epoch 103: loss=5272.457066  time=0.583s
+Epoch 104: loss=5300.519649  time=0.392s
+Epoch 105: loss=5037.744216  time=0.494s
+Epoch 106: loss=5734.611808  time=0.672s
+Epoch 107: loss=5762.066174  time=0.611s
+Epoch 108: loss=5504.378298  time=0.708s
+Epoch 109: loss=5314.625191  time=0.665s
+Epoch 110: loss=4795.971139  time=0.582s
+Epoch 111: loss=6108.632377  time=0.458s
+Epoch 112: loss=5564.931665  time=0.583s
+Epoch 113: loss=5613.225838  time=0.303s
+Epoch 114: loss=5051.465257  time=0.618s
+Epoch 115: loss=4978.737097  time=0.607s
+Epoch 116: loss=5311.208927  time=0.565s
+Epoch 117: loss=5992.226467  time=0.662s
+Epoch 118: loss=4912.700970  time=0.533s
+Epoch 119: loss=10083.187097  time=0.455s
+Epoch 120: loss=11975.943148  time=0.585s
+Epoch 121: loss=13739.019466  time=0.603s
+Epoch 122: loss=11326.959920  time=0.605s
+Epoch 123: loss=11071.532182  time=0.606s
+Epoch 124: loss=8411.421493  time=0.584s
+Epoch 125: loss=6461.692403  time=0.501s
+Epoch 126: loss=6905.756901  time=0.518s
+Epoch 127: loss=6622.831986  time=0.629s
+Epoch 128: loss=5939.391211  time=0.559s
+Epoch 129: loss=6415.921676  time=0.753s
+Epoch 130: loss=6359.300208  time=0.657s
+Epoch 131: loss=5823.631390  time=0.462s
+Epoch 132: loss=7717.329041  time=0.364s
+Epoch 133: loss=6225.989937  time=0.365s
+Epoch 134: loss=5983.787134  time=0.429s
+Epoch 135: loss=5584.612093  time=0.338s
+Epoch 136: loss=5360.286597  time=0.590s
+Epoch 137: loss=5126.761869  time=0.449s
+Epoch 138: loss=4934.811112  time=0.495s
+Epoch 139: loss=5200.971480  time=0.583s
+Epoch 140: loss=6606.748432  time=0.581s
+Epoch 141: loss=5425.621572  time=0.498s
+Epoch 142: loss=5603.806079  time=0.555s
+Epoch 143: loss=4878.620571  time=0.891s
+Epoch 144: loss=5683.626361  time=0.436s
+Epoch 145: loss=10961.570414  time=0.508s
+Epoch 146: loss=6846.551050  time=0.645s
+Epoch 147: loss=5722.682589  time=0.538s
+Epoch 148: loss=6290.375234  time=0.378s
+Epoch 149: loss=8525.365104  time=0.379s
+Epoch 150: loss=4385.971370  time=0.778s
+Epoch 151: loss=4652.813468  time=0.698s
+Epoch 152: loss=4018.377256  time=0.459s
+Epoch 153: loss=5936.582928  time=0.390s
+Epoch 154: loss=4609.816974  time=0.492s
+Epoch 155: loss=4308.993746  time=0.410s
+Epoch 156: loss=4644.520685  time=0.395s
+Epoch 157: loss=5008.254856  time=0.533s
+Epoch 158: loss=5399.845351  time=0.402s
+Epoch 159: loss=5370.815013  time=0.814s
+Epoch 160: loss=5075.369615  time=0.419s
+Epoch 161: loss=4465.887427  time=0.530s
+Epoch 162: loss=4787.515210  time=0.363s
+Epoch 163: loss=5117.161857  time=0.600s
+Epoch 164: loss=4661.718774  time=0.772s
+Epoch 165: loss=4274.069816  time=0.594s
+Epoch 166: loss=4656.235026  time=0.584s
+Epoch 167: loss=4559.150480  time=0.489s
+Epoch 168: loss=4886.060012  time=0.624s
+Epoch 169: loss=4960.908411  time=0.396s
+Epoch 170: loss=5212.749093  time=0.595s
+Epoch 171: loss=4400.190735  time=0.620s
+Epoch 172: loss=4751.067275  time=0.607s
+Epoch 173: loss=4451.697974  time=0.633s
+Epoch 174: loss=4591.865485  time=0.590s
+Epoch 175: loss=4036.109041  time=0.580s
+Epoch 176: loss=4534.656842  time=0.536s
+Epoch 177: loss=3962.921706  time=0.544s
+Epoch 178: loss=4668.937506  time=0.675s
+Epoch 179: loss=4632.478678  time=0.597s
+Epoch 180: loss=4754.101799  time=0.633s
+Epoch 181: loss=5109.585278  time=0.464s
+Epoch 182: loss=4190.311275  time=0.534s
+Epoch 183: loss=4940.395211  time=0.505s
+Epoch 184: loss=4585.817043  time=0.528s
+Epoch 185: loss=5502.545754  time=0.655s
+Epoch 186: loss=4921.276902  time=0.622s
+Epoch 187: loss=4515.865387  time=0.512s
+Epoch 188: loss=4208.035044  time=0.561s
+Epoch 189: loss=4609.602171  time=0.445s
+Epoch 190: loss=4429.432434  time=0.681s
+Epoch 191: loss=4203.146501  time=0.553s
+Epoch 192: loss=4883.070644  time=0.615s
+Epoch 193: loss=4108.594853  time=0.609s
+Epoch 194: loss=4462.248808  time=0.597s
+Epoch 195: loss=4617.540291  time=0.621s
+Epoch 196: loss=4381.571364  time=0.669s
+Epoch 197: loss=4295.161245  time=0.564s
+Epoch 198: loss=4544.686422  time=0.555s
+Epoch 199: loss=4741.930780  time=0.635s
+Epoch 200: loss=4507.793335  time=0.604s
+Epoch 201: loss=4586.007229  time=0.514s
+Epoch 202: loss=3737.959967  time=0.522s
+Epoch 203: loss=4426.846273  time=0.604s
+Epoch 204: loss=11813.443719  time=0.556s
+Epoch 205: loss=11636.825488  time=0.626s
+Epoch 206: loss=9696.011816  time=0.734s
+Epoch 207: loss=6500.439783  time=0.566s
+Epoch 208: loss=5614.951855  time=0.564s
+Epoch 209: loss=5670.986206  time=0.466s
+Epoch 210: loss=5180.054940  time=0.615s
+Epoch 211: loss=4713.328129  time=0.465s
+Epoch 212: loss=5797.017767  time=0.586s
+Epoch 213: loss=4628.121391  time=0.692s
+Epoch 214: loss=4746.712366  time=0.580s
+Epoch 215: loss=5607.295247  time=0.688s
+Epoch 216: loss=5058.933923  time=0.648s
+Epoch 217: loss=5855.988208  time=0.641s
+Epoch 218: loss=4520.177077  time=0.587s
+Epoch 219: loss=5258.235695  time=0.484s
+Epoch 220: loss=4730.490914  time=0.778s
+Epoch 221: loss=5093.969051  time=0.626s
+Epoch 222: loss=5717.685775  time=0.474s
+Epoch 223: loss=4881.277427  time=0.604s
+Epoch 224: loss=4903.241357  time=0.631s
+Epoch 225: loss=5585.425926  time=0.681s
+Epoch 226: loss=4370.628678  time=0.581s
+Epoch 227: loss=5586.499268  time=0.667s
+Epoch 228: loss=5211.010476  time=0.454s
+Epoch 229: loss=4804.659385  time=0.452s
+Epoch 230: loss=5224.345063  time=0.456s
+Epoch 231: loss=4868.276088  time=0.522s
+Epoch 232: loss=4759.220620  time=0.381s
+Epoch 233: loss=4633.899125  time=0.355s
+Epoch 234: loss=4769.209056  time=0.674s
+Epoch 235: loss=5025.310856  time=0.718s
+Epoch 236: loss=4699.405396  time=0.653s
+Epoch 237: loss=4661.704038  time=0.565s
+Epoch 238: loss=5158.339962  time=0.683s
+Epoch 239: loss=4997.799436  time=0.577s
+Epoch 240: loss=4915.295504  time=0.493s
+Epoch 241: loss=5863.820079  time=0.868s
+Epoch 242: loss=4335.588184  time=0.616s
+Epoch 243: loss=4864.627053  time=0.404s
+Epoch 244: loss=6154.781299  time=0.547s
+Epoch 245: loss=4804.851571  time=0.626s
+Epoch 246: loss=4676.456960  time=0.584s
+Epoch 247: loss=4906.091079  time=0.580s
+Epoch 248: loss=6145.382363  time=0.860s
+Epoch 249: loss=4895.426149  time=0.601s
+Epoch 250: loss=4788.498446  time=0.576s
+Epoch 251: loss=4681.607052  time=0.685s
+Epoch 252: loss=4580.190350  time=0.480s
+Epoch 253: loss=4824.500177  time=0.364s
+Epoch 254: loss=4940.213043  time=0.368s
+Epoch 255: loss=4753.453711  time=0.875s
+Epoch 256: loss=4558.011896  time=0.622s
+Epoch 257: loss=4377.275028  time=0.391s
+Epoch 258: loss=4205.702132  time=0.578s
+Epoch 259: loss=5424.447622  time=0.553s
+Epoch 260: loss=6477.783954  time=0.522s
+Epoch 261: loss=4455.567849  time=0.484s
+Epoch 262: loss=4920.249459  time=0.815s
+Epoch 263: loss=4321.338153  time=0.568s
+Epoch 264: loss=5414.633217  time=0.503s
+Epoch 265: loss=4687.109001  time=0.502s
+Epoch 266: loss=4401.646623  time=0.585s
+Epoch 267: loss=4452.890778  time=0.591s
+Epoch 268: loss=4451.372280  time=0.509s
+Epoch 269: loss=4335.345500  time=0.828s
+Epoch 270: loss=4587.978908  time=0.460s
+Epoch 271: loss=9084.195772  time=0.476s
+Epoch 272: loss=6216.394124  time=0.684s
+Epoch 273: loss=4359.347375  time=0.581s
+Epoch 274: loss=5803.336654  time=0.507s
+Epoch 275: loss=4883.384629  time=0.571s
+Epoch 276: loss=5034.823979  time=0.856s
+Epoch 277: loss=4320.145121  time=0.574s
+Epoch 278: loss=5473.629854  time=0.529s
+Epoch 279: loss=4940.633317  time=0.631s
+Epoch 280: loss=4740.784599  time=0.555s
+Epoch 281: loss=4908.972380  time=0.482s
+Epoch 282: loss=4432.184873  time=0.574s
+Epoch 283: loss=4394.405668  time=0.607s
+Epoch 284: loss=4498.981921  time=0.471s
+Epoch 285: loss=4861.634442  time=0.531s
+Epoch 286: loss=4131.106653  time=0.646s
+Epoch 287: loss=4310.242684  time=0.612s
+Epoch 288: loss=4549.635366  time=0.591s
+Epoch 289: loss=4760.255835  time=0.568s
+Epoch 290: loss=4048.092641  time=0.758s
+Epoch 291: loss=4654.037801  time=0.554s
+Epoch 292: loss=4230.206771  time=0.469s
+Epoch 293: loss=4812.582247  time=0.689s
+Epoch 294: loss=4606.247565  time=0.412s
+Epoch 295: loss=4494.933472  time=0.469s
+Epoch 296: loss=5087.375690  time=0.565s
+Epoch 297: loss=5726.283502  time=0.796s
+Epoch 298: loss=4614.329645  time=0.570s
+Epoch 299: loss=5270.775541  time=0.453s
+Epoch 300: loss=4499.273629  time=0.666s
+Epoch 301: loss=4182.934487  time=0.432s
+Epoch 302: loss=4950.950342  time=0.467s
+Epoch 303: loss=4812.215289  time=0.456s
+Epoch 304: loss=4247.262345  time=0.842s
+Epoch 305: loss=4446.060234  time=0.344s
+Epoch 306: loss=4562.517511  time=0.359s
+Epoch 307: loss=4304.724408  time=0.352s
+Epoch 308: loss=4444.480568  time=0.639s
+Epoch 309: loss=4092.224703  time=0.524s
+Epoch 310: loss=5014.605872  time=0.560s
+Epoch 311: loss=4367.748795  time=0.832s
+Epoch 312: loss=4534.364421  time=0.618s
+Epoch 313: loss=3997.259904  time=0.430s
+Epoch 314: loss=4550.632257  time=0.471s
+Epoch 315: loss=4302.877362  time=0.673s
+Epoch 316: loss=4354.198706  time=0.519s
+Epoch 317: loss=4408.248197  time=0.453s
+Epoch 318: loss=3916.092344  time=0.764s
+Epoch 319: loss=4241.565424  time=0.695s
+Epoch 320: loss=4550.961951  time=0.536s
+Epoch 321: loss=4201.379399  time=0.557s
+Epoch 322: loss=4237.488169  time=0.625s
+Epoch 323: loss=4285.338078  time=0.427s
+Epoch 324: loss=4222.121116  time=0.425s
+Epoch 325: loss=4656.278153  time=0.376s
+Epoch 326: loss=3963.589268  time=0.221s
+Epoch 327: loss=4250.856781  time=0.217s
+Epoch 328: loss=5618.189124  time=0.233s
+Epoch 329: loss=4156.480062  time=0.277s
+Epoch 330: loss=4455.689376  time=0.358s
+Epoch 331: loss=4408.901147  time=0.326s
+Epoch 332: loss=4445.501835  time=0.302s
+Epoch 333: loss=4349.645862  time=0.236s
+Epoch 334: loss=4874.748053  time=0.277s
+Epoch 335: loss=3952.172909  time=0.310s
+Epoch 336: loss=4362.110264  time=0.388s
+Epoch 337: loss=4878.161265  time=0.288s
+Epoch 338: loss=4335.804521  time=0.313s
+Epoch 339: loss=3877.864518  time=0.485s
+Epoch 340: loss=4181.564398  time=0.458s
+Epoch 341: loss=3979.840570  time=0.360s
+Epoch 342: loss=4163.262846  time=0.369s
+Epoch 343: loss=3696.367128  time=0.450s
+Epoch 344: loss=7939.140499  time=0.313s
+Epoch 345: loss=8217.195752  time=0.361s
+Epoch 346: loss=7651.288086  time=0.594s
+Epoch 347: loss=7627.358101  time=0.379s
+Epoch 348: loss=7076.085803  time=0.343s
+Epoch 349: loss=6824.175610  time=0.352s
+Epoch 350: loss=7295.690169  time=0.258s
+Epoch 351: loss=7713.435620  time=0.350s
+Epoch 352: loss=6448.173456  time=0.304s
+Epoch 353: loss=7091.051318  time=0.342s
+Epoch 354: loss=7274.700663  time=0.270s
+Epoch 355: loss=8049.709558  time=0.260s
+Epoch 356: loss=7682.387305  time=0.275s
+Epoch 357: loss=7441.775464  time=0.308s
+Epoch 358: loss=6603.556750  time=0.288s
+Epoch 359: loss=7715.038220  time=0.311s
+Epoch 360: loss=7570.459613  time=0.486s
+Epoch 361: loss=6380.903664  time=0.384s
+Epoch 362: loss=5992.650389  time=0.251s
+Epoch 363: loss=10514.671529  time=0.316s
+Epoch 364: loss=10676.466048  time=0.360s
+Epoch 365: loss=11458.140983  time=0.364s
+Epoch 366: loss=10249.171720  time=0.403s
+Epoch 367: loss=9757.984501  time=0.551s
+Epoch 368: loss=9572.641398  time=0.317s
+Epoch 369: loss=8858.355566  time=0.303s
+Epoch 370: loss=8507.225146  time=0.343s
+Epoch 371: loss=8139.591003  time=0.396s
+Epoch 372: loss=8624.299772  time=0.452s
+Epoch 373: loss=8274.747795  time=0.570s
+Epoch 374: loss=8014.062655  time=0.606s
+Epoch 375: loss=7629.829903  time=0.485s
+Epoch 376: loss=7482.980514  time=0.376s
+Epoch 377: loss=6911.692472  time=0.390s
+Epoch 378: loss=6973.315275  time=0.282s
+Epoch 379: loss=6949.685307  time=0.354s
+Epoch 380: loss=6251.588359  time=0.405s
+Epoch 381: loss=6905.522262  time=0.487s
+Epoch 382: loss=6507.783757  time=0.433s
+Epoch 383: loss=6492.416227  time=0.364s
+Epoch 384: loss=6574.699223  time=0.419s
+Epoch 385: loss=6429.987826  time=0.343s
+Epoch 386: loss=6386.337785  time=0.423s
+Epoch 387: loss=5697.719637  time=0.362s
+Epoch 388: loss=6232.129909  time=0.516s
+Epoch 389: loss=6426.976497  time=0.461s
+Epoch 390: loss=5916.911629  time=0.339s
+Epoch 391: loss=6090.206917  time=0.348s
+Epoch 392: loss=6041.903194  time=0.384s
+Epoch 393: loss=5804.793917  time=0.394s
+Epoch 394: loss=6333.492037  time=0.367s
+Epoch 395: loss=5789.927303  time=0.457s
+Epoch 396: loss=5505.992224  time=0.333s
+Epoch 397: loss=5764.597119  time=0.313s
+Epoch 398: loss=6170.301868  time=0.373s
+Epoch 399: loss=5506.847599  time=0.379s
+Epoch 400: loss=5865.953642  time=0.381s
+Epoch 401: loss=5594.527901  time=0.439s
+Epoch 402: loss=5726.109595  time=0.520s
+Epoch 403: loss=5206.562838  time=0.433s
+Epoch 404: loss=5453.176172  time=0.508s
+Epoch 405: loss=5635.183447  time=0.343s
+Epoch 406: loss=5256.976807  time=0.314s
+Epoch 407: loss=5025.527787  time=0.294s
+Epoch 408: loss=5410.574727  time=0.301s
+Epoch 409: loss=4928.322502  time=0.452s
+Epoch 410: loss=5191.900802  time=0.345s
+Epoch 411: loss=5117.229384  time=0.301s
+Epoch 412: loss=5403.146313  time=0.277s
+Epoch 413: loss=4395.291274  time=0.284s
+Epoch 414: loss=4249.121444  time=0.349s
+Epoch 415: loss=4020.218209  time=0.418s
+Epoch 416: loss=3846.373846  time=0.600s
+Epoch 417: loss=3746.456791  time=0.492s
+Epoch 418: loss=3512.748153  time=0.308s
+Epoch 419: loss=3881.654344  time=0.311s
+Epoch 420: loss=3290.323724  time=0.392s
+Epoch 421: loss=3614.918510  time=0.295s
+Epoch 422: loss=3433.589693  time=0.290s
+Epoch 423: loss=3570.705900  time=0.446s
+Epoch 424: loss=4545.520939  time=0.303s
+Epoch 425: loss=3572.317879  time=0.359s
+Epoch 426: loss=3276.095205  time=0.455s
+Epoch 427: loss=3379.607098  time=0.288s
+Epoch 428: loss=3415.047028  time=0.270s
+Epoch 429: loss=3224.201898  time=0.270s
+Epoch 430: loss=2983.551233  time=0.360s
+Epoch 431: loss=3428.909383  time=0.290s
+Epoch 432: loss=3000.128050  time=0.265s
+Epoch 433: loss=3546.691136  time=0.253s
+Epoch 434: loss=2910.222660  time=0.295s
+Epoch 435: loss=3478.373686  time=0.288s
+Epoch 436: loss=3567.467442  time=0.339s
+Epoch 437: loss=3236.906431  time=0.502s
+Epoch 438: loss=3147.160308  time=0.469s
+Epoch 439: loss=3168.287384  time=0.429s
+Epoch 440: loss=3090.685433  time=0.284s
+Epoch 441: loss=2891.135391  time=0.276s
+Epoch 442: loss=2939.982831  time=0.362s
+Epoch 443: loss=3796.023875  time=0.420s
+Epoch 444: loss=3900.662380  time=0.537s
+Epoch 445: loss=3312.813622  time=0.364s
+Epoch 446: loss=2868.047929  time=0.546s
+Epoch 447: loss=2963.962396  time=0.659s
+Epoch 448: loss=2840.635740  time=0.419s
+Epoch 449: loss=3024.291705  time=0.350s
+Epoch 450: loss=3395.647028  time=0.378s
+Epoch 451: loss=2859.463263  time=0.519s
+Epoch 452: loss=2932.666914  time=0.462s
+Epoch 453: loss=2863.912720  time=0.334s
+Epoch 454: loss=2878.623574  time=0.342s
+Epoch 455: loss=3073.815680  time=0.461s
+Epoch 456: loss=2762.688055  time=0.552s
+Epoch 457: loss=2905.071582  time=0.518s
+Epoch 458: loss=2900.830745  time=0.540s
+Epoch 459: loss=2947.565983  time=0.309s
+Epoch 460: loss=2698.696327  time=0.292s
+Epoch 461: loss=3222.471069  time=0.359s
+Epoch 462: loss=2793.334865  time=0.496s
+Epoch 463: loss=2860.891581  time=0.374s
+Epoch 464: loss=2879.785398  time=0.480s
+Epoch 465: loss=3085.916093  time=0.595s
+Epoch 466: loss=2785.444582  time=0.377s
+Epoch 467: loss=2820.963963  time=0.428s
+Epoch 468: loss=2530.831708  time=0.281s
+Epoch 469: loss=2989.910417  time=0.276s
+Epoch 470: loss=3108.440108  time=0.256s
+Epoch 471: loss=3112.980402  time=0.303s
+Epoch 472: loss=2930.146878  time=0.505s
+Epoch 473: loss=2943.482872  time=0.329s
+Epoch 474: loss=3004.882509  time=0.273s
+Epoch 475: loss=2529.043243  time=0.253s
+Epoch 476: loss=3083.056828  time=0.259s
+Epoch 477: loss=2881.202275  time=0.267s
+Epoch 478: loss=2841.965871  time=0.284s
+Epoch 479: loss=3038.052024  time=0.396s
+Epoch 480: loss=2816.212693  time=0.295s
+Epoch 481: loss=2589.866587  time=0.297s
+Epoch 482: loss=2757.681298  time=0.258s
+Epoch 483: loss=3446.109115  time=0.282s
+Epoch 484: loss=2757.032857  time=0.318s
+Epoch 485: loss=2917.343998  time=0.368s
+Epoch 486: loss=2852.081115  time=0.553s
+Epoch 487: loss=2773.104909  time=0.352s
+Epoch 488: loss=4940.256993  time=0.247s
+Epoch 489: loss=4075.772723  time=0.263s
+Epoch 490: loss=2898.351802  time=0.282s
+Epoch 491: loss=2735.281521  time=0.312s
+Epoch 492: loss=2784.638696  time=0.328s
+Epoch 493: loss=3070.339702  time=0.401s
+Epoch 494: loss=2862.479913  time=0.255s
+Epoch 495: loss=3533.338698  time=0.264s
+Epoch 496: loss=3034.863967  time=0.373s
+Epoch 497: loss=2523.350031  time=0.453s
+Epoch 498: loss=3100.453514  time=0.472s
+Epoch 499: loss=2871.876129  time=0.394s
+Epoch 500: loss=2715.326444  time=0.444s
+Epoch 501: loss=2664.554468  time=0.387s
+Epoch 502: loss=2635.783807  time=0.391s
+Epoch 503: loss=2745.928870  time=0.324s
+Epoch 504: loss=3026.235388  time=0.352s
+Epoch 505: loss=2410.402090  time=0.425s
+Epoch 506: loss=2890.777266  time=0.483s
+Epoch 507: loss=2842.300136  time=0.659s
+Epoch 508: loss=2659.003767  time=0.315s
+Epoch 509: loss=2955.336695  time=0.327s
+Epoch 510: loss=2885.219086  time=0.445s
+Epoch 511: loss=2881.701208  time=0.440s
+Epoch 512: loss=3384.558270  time=0.367s
+Epoch 513: loss=2981.681305  time=0.303s
+Epoch 514: loss=3341.615045  time=0.451s
+Epoch 515: loss=2906.053973  time=0.447s
+Epoch 516: loss=2551.402993  time=0.360s
+Epoch 517: loss=2929.490820  time=0.321s
+Epoch 518: loss=2669.440335  time=0.374s
+Epoch 519: loss=3091.899672  time=0.289s
+Epoch 520: loss=2769.642647  time=0.235s
+Epoch 521: loss=2643.831510  time=0.318s
+Epoch 522: loss=3244.318060  time=0.407s
+Epoch 523: loss=2819.869440  time=0.385s
+Epoch 524: loss=3085.201245  time=0.362s
+Epoch 525: loss=2848.299465  time=0.384s
+Epoch 526: loss=3133.205139  time=0.450s
+Epoch 527: loss=3039.134481  time=0.379s
+Epoch 528: loss=2712.790369  time=0.605s
+Epoch 529: loss=2702.204355  time=0.352s
+Epoch 530: loss=2901.301225  time=0.403s
+Epoch 531: loss=3373.838534  time=0.342s
+Epoch 532: loss=2682.336267  time=0.286s
+Epoch 533: loss=2592.518170  time=0.324s
+Epoch 534: loss=3075.355788  time=0.302s
+Epoch 535: loss=2824.269324  time=0.488s
+Epoch 536: loss=2537.804624  time=0.436s
+Epoch 537: loss=2843.865776  time=0.389s
+Epoch 538: loss=2812.742478  time=0.315s
+Epoch 539: loss=2912.804905  time=0.284s
+Epoch 540: loss=3079.310502  time=0.342s
+Epoch 541: loss=2882.668250  time=0.379s
+Epoch 542: loss=2843.767440  time=0.633s
+Epoch 543: loss=2819.030609  time=0.461s
+Epoch 544: loss=2951.945622  time=0.358s
+Epoch 545: loss=2411.158661  time=0.388s
+Epoch 546: loss=3415.471759  time=0.359s
+Epoch 547: loss=2664.881185  time=0.473s
+Epoch 548: loss=2968.212897  time=0.345s
+Epoch 549: loss=2541.526900  time=0.466s
+Epoch 550: loss=3061.376595  time=0.486s
+Epoch 551: loss=2814.414679  time=0.378s
+Epoch 552: loss=2658.621999  time=0.381s
+Epoch 553: loss=2709.117993  time=0.422s
+Epoch 554: loss=2904.003880  time=0.363s
+Epoch 555: loss=2988.756862  time=0.402s
+Epoch 556: loss=2560.185380  time=0.415s
+Epoch 557: loss=2935.667449  time=0.339s
+Epoch 558: loss=3077.091667  time=0.388s
+Epoch 559: loss=2758.038470  time=0.469s
+Epoch 560: loss=2873.055133  time=0.441s
+Epoch 561: loss=2958.808394  time=0.404s
+Epoch 562: loss=2885.229781  time=0.268s
+Epoch 563: loss=2922.324963  time=0.397s
+Epoch 564: loss=2755.503437  time=0.304s
+Epoch 565: loss=2843.282520  time=0.303s
+Epoch 566: loss=2829.446465  time=0.294s
+Epoch 567: loss=2976.285608  time=0.246s
+Epoch 568: loss=2679.401524  time=0.276s
+Epoch 569: loss=2898.241231  time=0.414s
+Epoch 570: loss=2920.114976  time=0.525s
+Epoch 571: loss=2792.514154  time=0.358s
+Epoch 572: loss=3000.111924  time=0.407s
+Epoch 573: loss=2875.495499  time=0.312s
+Epoch 574: loss=2866.112990  time=0.332s
+Epoch 575: loss=2826.429429  time=0.383s
+Epoch 576: loss=2573.114183  time=0.336s
+Epoch 577: loss=2612.097976  time=0.568s
+Epoch 578: loss=2685.197982  time=0.324s
+Epoch 579: loss=2856.640196  time=0.321s
+Epoch 580: loss=2577.780772  time=0.319s
+Epoch 581: loss=3160.370766  time=0.271s
+Epoch 582: loss=3053.663131  time=0.279s
+Epoch 583: loss=2365.309397  time=0.271s
+Epoch 584: loss=2908.884537  time=0.363s
+Epoch 585: loss=2575.278690  time=0.355s
+Epoch 586: loss=3056.531596  time=0.255s
+Epoch 587: loss=2965.623492  time=0.320s
+Epoch 588: loss=2843.343650  time=0.293s
+Epoch 589: loss=2800.988582  time=0.269s
+Epoch 590: loss=2956.860968  time=0.388s
+Epoch 591: loss=2542.408376  time=0.482s
+Epoch 592: loss=2813.001117  time=0.401s
+Epoch 593: loss=2883.732540  time=0.377s
+Epoch 594: loss=2997.062115  time=0.365s
+Epoch 595: loss=2564.457888  time=0.382s
+Epoch 596: loss=2796.892375  time=0.386s
+Epoch 597: loss=2537.798040  time=0.248s
+Epoch 598: loss=2784.173163  time=0.324s
+Epoch 599: loss=2822.835917  time=0.263s
+Epoch 600: loss=2388.104995  time=0.243s
+Epoch 601: loss=2924.788316  time=0.319s
+Epoch 602: loss=2603.212616  time=0.252s
+Epoch 603: loss=2684.084552  time=0.239s
+Epoch 604: loss=2871.522723  time=0.256s
+Epoch 605: loss=2643.196605  time=0.329s
+Epoch 606: loss=2571.168302  time=0.259s
+Epoch 607: loss=2900.924618  time=0.295s
+Epoch 608: loss=2533.258586  time=0.282s
+Epoch 609: loss=2497.545498  time=0.292s
+Epoch 610: loss=2533.929598  time=0.296s
+Epoch 611: loss=2710.953147  time=0.332s
+Epoch 612: loss=3044.598475  time=0.536s
+Epoch 613: loss=2968.980910  time=0.279s
+Epoch 614: loss=2760.907621  time=0.289s
+Epoch 615: loss=2797.613175  time=0.261s
+Epoch 616: loss=2759.533258  time=0.291s
+Epoch 617: loss=2841.082906  time=0.281s
+Epoch 618: loss=2835.506572  time=0.486s
+Epoch 619: loss=2785.788918  time=0.441s
+Epoch 620: loss=3313.332247  time=0.350s
+Epoch 621: loss=2688.781451  time=0.285s
+Epoch 622: loss=2987.674257  time=0.282s
+Epoch 623: loss=2639.450955  time=0.364s
+Epoch 624: loss=2675.405568  time=0.346s
+Epoch 625: loss=2444.760679  time=0.329s
+Epoch 626: loss=2706.732259  time=0.503s
+Epoch 627: loss=2765.149955  time=0.347s
+Epoch 628: loss=2658.067794  time=0.383s
+Epoch 629: loss=2592.331986  time=0.446s
+Epoch 630: loss=2751.046444  time=0.333s
+Epoch 631: loss=2684.073887  time=0.403s
+Epoch 632: loss=2291.999669  time=0.332s
+Epoch 633: loss=3026.763161  time=0.476s
+Epoch 634: loss=2546.247874  time=0.436s
+Epoch 635: loss=2528.542971  time=0.341s
+Epoch 636: loss=2738.300375  time=0.339s
+Epoch 637: loss=2481.246617  time=0.296s
+Epoch 638: loss=2770.851896  time=0.340s
+Epoch 639: loss=2629.465464  time=0.395s
+Epoch 640: loss=2651.948676  time=0.513s
+Epoch 641: loss=3174.171456  time=0.371s
+Epoch 642: loss=2678.218332  time=0.277s
+Epoch 643: loss=2836.035022  time=0.312s
+Epoch 644: loss=2796.356910  time=0.286s
+Epoch 645: loss=2581.890780  time=0.373s
+Epoch 646: loss=2526.883278  time=0.324s
+Epoch 647: loss=2639.059197  time=0.510s
+Epoch 648: loss=3041.404130  time=0.384s
+Epoch 649: loss=2581.226317  time=0.408s
+Epoch 650: loss=2553.480573  time=0.450s
+Epoch 651: loss=2918.613129  time=0.319s
+Epoch 652: loss=2843.408463  time=0.445s
+Epoch 653: loss=2437.648286  time=0.305s
+Epoch 654: loss=3319.242544  time=0.371s
+Epoch 655: loss=2742.150903  time=0.385s
+Epoch 656: loss=2982.856807  time=0.343s
+Epoch 657: loss=2348.683905  time=0.254s
+Epoch 658: loss=2844.867914  time=0.227s
+Epoch 659: loss=3132.685588  time=0.229s
+Epoch 660: loss=2702.609906  time=0.240s
+Epoch 661: loss=2871.151097  time=0.392s
+Epoch 662: loss=2418.562890  time=0.368s
+Epoch 663: loss=3341.631364  time=0.391s
+Epoch 664: loss=2663.739329  time=0.443s
+Epoch 665: loss=2608.425065  time=0.429s
+Epoch 666: loss=2704.170221  time=0.286s
+Epoch 667: loss=3353.438131  time=0.410s
+Epoch 668: loss=3063.573867  time=0.491s
+Epoch 669: loss=2593.836700  time=0.340s
+Epoch 670: loss=3017.582743  time=0.385s
+Epoch 671: loss=2813.539353  time=0.273s
+Epoch 672: loss=2682.473212  time=0.287s
+Epoch 673: loss=2613.364128  time=0.400s
+Epoch 674: loss=2407.945999  time=0.340s
+Epoch 675: loss=3063.804968  time=0.411s
+Epoch 676: loss=2653.612329  time=0.356s
+Epoch 677: loss=2459.113051  time=0.319s
+Epoch 678: loss=2849.420382  time=0.357s
+Epoch 679: loss=3034.025446  time=0.361s
+Epoch 680: loss=2762.365125  time=0.313s
+Epoch 681: loss=3173.485162  time=0.311s
+Epoch 682: loss=2667.892403  time=0.505s
+Epoch 683: loss=2657.197404  time=0.422s
+Epoch 684: loss=2770.485477  time=0.390s
+Epoch 685: loss=2950.396267  time=0.377s
+Epoch 686: loss=2562.435152  time=0.426s
+Epoch 687: loss=2981.407436  time=0.374s
+Epoch 688: loss=2459.602572  time=0.325s
+Epoch 689: loss=2455.926817  time=0.467s
+Epoch 690: loss=2963.272576  time=0.379s
+Epoch 691: loss=2871.584535  time=0.367s
+Epoch 692: loss=2750.484070  time=0.411s
+Epoch 693: loss=2713.459428  time=0.288s
+Epoch 694: loss=2546.071056  time=0.370s
+Epoch 695: loss=2929.720699  time=0.358s
+Epoch 696: loss=2735.931239  time=0.495s
+Epoch 697: loss=4173.845329  time=0.424s
+Epoch 698: loss=2363.175946  time=0.329s
+Epoch 699: loss=2827.261361  time=0.495s
+Epoch 700: loss=2779.944808  time=0.351s
+Epoch 701: loss=2500.378575  time=0.298s
+Epoch 702: loss=2819.321864  time=0.309s
+Epoch 703: loss=3033.024074  time=0.455s
+Epoch 704: loss=2901.299235  time=0.325s
+Epoch 705: loss=2445.966103  time=0.307s
+Epoch 706: loss=3105.407990  time=0.323s
+Epoch 707: loss=2429.955634  time=0.293s
+Epoch 708: loss=2924.473057  time=0.268s
+Epoch 709: loss=2712.697992  time=0.297s
+Epoch 710: loss=2732.288861  time=0.417s
+Epoch 711: loss=2439.847270  time=0.385s
+Epoch 712: loss=2881.193781  time=0.349s
+Epoch 713: loss=2672.496954  time=0.279s
+Epoch 714: loss=2715.974707  time=0.253s
+Epoch 715: loss=2521.477051  time=0.281s
+Epoch 716: loss=2617.897198  time=0.256s
+Epoch 717: loss=2986.099162  time=0.478s
+Epoch 718: loss=2620.789166  time=0.304s
+Epoch 719: loss=2200.611344  time=0.310s
+Epoch 720: loss=2669.530676  time=0.277s
+Epoch 721: loss=2805.864948  time=0.318s
+Epoch 722: loss=2346.772242  time=0.319s
+Epoch 723: loss=2761.620209  time=0.414s
+Epoch 724: loss=2842.897805  time=0.503s
+Epoch 725: loss=2880.233376  time=0.351s
+Epoch 726: loss=2651.190763  time=0.433s
+Epoch 727: loss=2869.233339  time=0.372s
+Epoch 728: loss=3162.562185  time=0.494s
+Epoch 729: loss=2612.382389  time=0.405s
+Epoch 730: loss=2562.165293  time=0.314s
+Epoch 731: loss=2557.460895  time=0.389s
+Epoch 732: loss=2664.392069  time=0.354s
+Epoch 733: loss=2434.209511  time=0.287s
+Epoch 734: loss=2561.676711  time=0.282s
+Epoch 735: loss=2866.120795  time=0.301s
+Epoch 736: loss=2234.808742  time=0.256s
+Epoch 737: loss=2782.873199  time=0.260s
+Epoch 738: loss=2931.462964  time=0.381s
+Epoch 739: loss=2380.169617  time=0.343s
+Epoch 740: loss=2518.077476  time=0.284s
+Epoch 741: loss=2879.033976  time=0.325s
+Epoch 742: loss=2617.701986  time=0.352s
+Epoch 743: loss=2922.375939  time=0.371s
+Epoch 744: loss=2612.983435  time=0.340s
+Epoch 745: loss=2589.821667  time=0.490s
+Epoch 746: loss=2765.472445  time=0.289s
+Epoch 747: loss=2643.446039  time=0.314s
+Epoch 748: loss=2569.949965  time=0.435s
+Epoch 749: loss=2567.387465  time=0.302s
+Epoch 750: loss=2639.453229  time=0.319s
+Epoch 751: loss=2402.509310  time=0.331s
+Epoch 752: loss=2779.193205  time=0.468s
+Epoch 753: loss=2516.196646  time=0.354s
+Epoch 754: loss=2663.143916  time=0.282s
+Epoch 755: loss=2612.921637  time=0.262s
+Epoch 756: loss=2540.309764  time=0.332s
+Epoch 757: loss=2876.215210  time=0.381s
+Epoch 758: loss=2793.421978  time=0.324s
+Epoch 759: loss=2659.532489  time=0.430s
+Epoch 760: loss=2404.237255  time=0.285s
+Epoch 761: loss=2237.509983  time=0.302s
+Epoch 762: loss=2769.905839  time=0.335s
+Epoch 763: loss=2661.739176  time=0.301s
+Epoch 764: loss=2474.016980  time=0.275s
+Epoch 765: loss=2902.245484  time=0.333s
+Epoch 766: loss=1972.953239  time=0.450s
+Epoch 767: loss=2988.540094  time=0.307s
+Epoch 768: loss=2016.604929  time=0.299s
+Epoch 769: loss=2559.865651  time=0.311s
+Epoch 770: loss=2200.912039  time=0.305s
+Epoch 771: loss=2489.113582  time=0.332s
+Epoch 772: loss=2418.797394  time=0.265s
+Epoch 773: loss=2693.537172  time=0.394s
+Epoch 774: loss=2436.102740  time=0.391s
+Epoch 775: loss=2480.856132  time=0.302s
+Epoch 776: loss=2754.557340  time=0.338s
+Epoch 777: loss=2338.400260  time=0.457s
+Epoch 778: loss=1967.244758  time=0.445s
+Epoch 779: loss=2724.495435  time=0.324s
+Epoch 780: loss=2469.500779  time=0.426s
+Epoch 781: loss=2440.397347  time=0.313s
+Epoch 782: loss=2550.438662  time=0.288s
+Epoch 783: loss=2325.660422  time=0.298s
+Epoch 784: loss=2452.496637  time=0.282s
+Epoch 785: loss=2603.488536  time=0.359s
+Epoch 786: loss=2395.409355  time=0.373s
+Epoch 787: loss=2356.109369  time=0.466s
+Epoch 788: loss=2488.477837  time=0.352s
+Epoch 789: loss=2956.865759  time=0.288s
+Epoch 790: loss=2321.233948  time=0.380s
+Epoch 791: loss=1975.197618  time=0.350s
+Epoch 792: loss=2367.637046  time=0.394s
+Epoch 793: loss=2399.356451  time=0.313s
+Epoch 794: loss=2127.485997  time=0.509s
+Epoch 795: loss=2542.808183  time=0.325s
+Epoch 796: loss=2342.703328  time=0.297s
+Epoch 797: loss=2205.140395  time=0.300s
+Epoch 798: loss=2330.371021  time=0.426s
+Epoch 799: loss=2167.706596  time=0.465s
+Epoch 800: loss=3121.452602  time=0.312s
+Epoch 801: loss=2351.169792  time=0.491s
+Epoch 802: loss=2189.409528  time=0.315s
+Epoch 803: loss=2180.584172  time=0.375s
+Epoch 804: loss=2538.904356  time=0.336s
+Epoch 805: loss=2342.024815  time=0.561s
+Epoch 806: loss=2437.906342  time=0.674s
+Epoch 807: loss=2480.763741  time=0.417s
+Epoch 808: loss=2590.240235  time=0.444s
+Epoch 809: loss=2641.430599  time=0.658s
+Epoch 810: loss=2204.752917  time=0.456s
+Epoch 811: loss=2244.071751  time=0.434s
+Epoch 812: loss=2490.932963  time=0.361s
+Epoch 813: loss=2137.976592  time=0.368s
+Epoch 814: loss=2347.136243  time=0.280s
+Epoch 815: loss=2174.202979  time=0.448s
+Epoch 816: loss=2452.411752  time=0.460s
+Epoch 817: loss=2195.709291  time=0.317s
+Epoch 818: loss=2499.318366  time=0.429s
+Epoch 819: loss=2243.283803  time=0.333s
+Epoch 820: loss=2199.257461  time=0.276s
+Epoch 821: loss=2396.188111  time=0.283s
+Epoch 822: loss=2039.318512  time=0.596s
+Epoch 823: loss=2106.206065  time=0.365s
+Epoch 824: loss=2082.839480  time=0.273s
+Epoch 825: loss=2845.178522  time=0.263s
+Epoch 826: loss=2110.832923  time=0.281s
+Epoch 827: loss=2134.552869  time=0.270s
+Epoch 828: loss=2237.428686  time=0.369s
+Epoch 829: loss=2411.856578  time=0.423s
+Epoch 830: loss=2329.340055  time=0.417s
+Epoch 831: loss=2243.054187  time=0.307s
+Epoch 832: loss=2140.490096  time=0.283s
+Epoch 833: loss=2441.327844  time=0.257s
+Epoch 834: loss=2346.028766  time=0.316s
+Epoch 835: loss=2150.864075  time=0.394s
+Epoch 836: loss=2574.001729  time=0.387s
+Epoch 837: loss=2178.259442  time=0.369s
+Epoch 838: loss=2401.246441  time=0.324s
+Epoch 839: loss=2227.261403  time=0.440s
+Epoch 840: loss=2421.641199  time=0.338s
+Epoch 841: loss=2145.334372  time=0.325s
+Epoch 842: loss=2109.268159  time=0.258s
+Epoch 843: loss=2061.082631  time=0.430s
+Epoch 844: loss=2070.938892  time=0.272s
+Epoch 845: loss=2313.778808  time=0.530s
+Epoch 846: loss=2489.113533  time=0.342s
+Epoch 847: loss=2451.711104  time=0.384s
+Epoch 848: loss=2144.125499  time=0.457s
+Epoch 849: loss=2411.097007  time=0.339s
+Epoch 850: loss=2182.838159  time=0.468s
+Epoch 851: loss=2087.727491  time=0.397s
+Epoch 852: loss=2397.290985  time=0.334s
+Epoch 853: loss=2051.445243  time=0.437s
+Epoch 854: loss=2394.309914  time=0.313s
+Epoch 855: loss=2262.613413  time=0.321s
+Epoch 856: loss=1947.709399  time=0.365s
+Epoch 857: loss=2375.507626  time=0.387s
+Epoch 858: loss=2636.551648  time=0.474s
+Epoch 859: loss=2041.587817  time=0.467s
+Epoch 860: loss=2109.458553  time=0.507s
+Epoch 861: loss=2158.256798  time=0.433s
+Epoch 862: loss=2247.415107  time=0.365s
+Epoch 863: loss=2364.208704  time=0.365s
+Epoch 864: loss=2304.006128  time=0.635s
+Epoch 865: loss=2034.392281  time=0.441s
+Epoch 866: loss=2181.867295  time=0.450s
+Epoch 867: loss=2021.807555  time=0.327s
+Epoch 868: loss=2278.254641  time=0.313s
+Epoch 869: loss=2379.093398  time=0.421s
+Epoch 870: loss=2414.221851  time=0.573s
+Epoch 871: loss=2247.719961  time=0.450s
+Epoch 872: loss=2336.810881  time=0.489s
+Epoch 873: loss=2278.577148  time=0.362s
+Epoch 874: loss=2069.934466  time=0.505s
+Epoch 875: loss=2125.873794  time=0.514s
+Epoch 876: loss=2184.110494  time=0.413s
+Epoch 877: loss=2393.672355  time=0.410s
+Epoch 878: loss=2121.526702  time=0.568s
+Epoch 879: loss=2629.453337  time=0.424s
+Epoch 880: loss=2099.596342  time=0.392s
+Epoch 881: loss=2440.237371  time=0.528s
+Epoch 882: loss=2486.940328  time=0.346s
+Epoch 883: loss=2028.049656  time=0.490s
+Epoch 884: loss=2150.990438  time=0.500s
+Epoch 885: loss=2174.342716  time=0.530s
+Epoch 886: loss=2259.944238  time=0.591s
+Epoch 887: loss=2022.536886  time=0.429s
+Epoch 888: loss=2002.296878  time=0.428s
+Epoch 889: loss=2448.334019  time=0.316s
+Epoch 890: loss=2013.184909  time=0.312s
+Epoch 891: loss=2814.128489  time=0.270s
+Epoch 892: loss=1963.078972  time=0.468s
+Epoch 893: loss=2198.370076  time=0.301s
+Epoch 894: loss=2203.126235  time=0.340s
+Epoch 895: loss=2388.927328  time=0.341s
+Epoch 896: loss=1800.362013  time=0.468s
+Epoch 897: loss=2386.090507  time=0.420s
+Epoch 898: loss=1962.962999  time=0.357s
+Epoch 899: loss=2599.356020  time=0.420s
+Epoch 900: loss=1826.969824  time=0.299s
+Epoch 901: loss=2109.054916  time=0.314s
+Epoch 902: loss=2133.124955  time=0.292s
+Epoch 903: loss=2502.981911  time=0.341s
+Epoch 904: loss=2308.939964  time=0.436s
+Epoch 905: loss=2054.166038  time=0.452s
+Epoch 906: loss=2022.277865  time=0.518s
+Epoch 907: loss=2075.281852  time=0.341s
+Epoch 908: loss=2071.724731  time=0.521s
+Epoch 909: loss=2008.849728  time=0.472s
+Epoch 910: loss=2146.637895  time=0.425s
+Epoch 911: loss=2294.545137  time=0.338s
+Epoch 912: loss=2421.165889  time=0.419s
+Epoch 913: loss=2341.182029  time=0.741s
+Epoch 914: loss=2441.082253  time=0.328s
+Epoch 915: loss=2266.548910  time=0.196s
+Epoch 916: loss=2000.559648  time=0.173s
+Epoch 917: loss=2162.046854  time=0.168s
+Epoch 918: loss=2357.797954  time=0.168s
+Epoch 919: loss=2126.132737  time=0.174s
+Epoch 920: loss=2278.123755  time=0.237s
+Epoch 921: loss=1941.394006  time=0.179s
+Epoch 922: loss=2310.295837  time=0.167s
+Epoch 923: loss=2096.073450  time=0.185s
+Epoch 924: loss=2277.017855  time=0.183s
+Epoch 925: loss=2351.088501  time=0.250s
+Epoch 926: loss=2271.484395  time=0.212s
+Epoch 927: loss=1965.032713  time=0.258s
+Epoch 928: loss=2263.713219  time=0.181s
+Epoch 929: loss=2293.731305  time=0.190s
+Epoch 930: loss=2009.816260  time=0.189s
+Epoch 931: loss=2042.274503  time=0.187s
+Epoch 932: loss=2079.267448  time=0.200s
+Epoch 933: loss=2168.535180  time=0.197s
+Epoch 934: loss=1918.986620  time=0.271s
+Epoch 935: loss=2392.777603  time=0.193s
+Epoch 936: loss=2345.662817  time=0.177s
+Epoch 937: loss=2203.897327  time=0.187s
+Epoch 938: loss=2145.169869  time=0.179s
+Epoch 939: loss=2113.598979  time=0.187s
+Epoch 940: loss=2022.543276  time=0.497s
+Epoch 941: loss=2635.203294  time=0.534s
+Epoch 942: loss=1791.188902  time=0.423s
+Epoch 943: loss=2472.245083  time=0.666s
+Epoch 944: loss=1965.426387  time=0.546s
+Epoch 945: loss=1642.130701  time=0.453s
+Epoch 946: loss=2379.118608  time=0.536s
+Epoch 947: loss=2326.169419  time=0.621s
+Epoch 948: loss=2090.633598  time=0.628s
+Epoch 949: loss=1764.197944  time=0.383s
+Epoch 950: loss=2036.042330  time=0.628s
+Epoch 951: loss=5391.337526  time=0.692s
+Epoch 952: loss=4381.189347  time=0.478s
+Epoch 953: loss=4016.892074  time=0.555s
+Epoch 954: loss=3954.769191  time=0.598s
+Epoch 955: loss=3791.357495  time=0.720s
+Epoch 956: loss=3310.049986  time=0.411s
+Epoch 957: loss=3544.046663  time=0.666s
+Epoch 958: loss=2802.945367  time=0.599s
+Epoch 959: loss=2017.811072  time=0.442s
+Epoch 960: loss=2210.035468  time=0.486s
+Epoch 961: loss=2508.968573  time=0.668s
+Epoch 962: loss=2281.917352  time=0.769s
+Epoch 963: loss=2215.284874  time=0.500s
+Epoch 964: loss=1990.089563  time=0.648s
+Epoch 965: loss=2142.517989  time=0.712s
+Epoch 966: loss=2046.755193  time=0.472s
+Epoch 967: loss=2134.832623  time=0.633s
+Epoch 968: loss=2242.599312  time=0.682s
+Epoch 969: loss=1949.031510  time=0.612s
+Epoch 970: loss=1941.505066  time=0.586s
+Epoch 971: loss=1944.987338  time=0.627s
+Epoch 972: loss=1981.835510  time=0.546s
+Epoch 973: loss=2254.700224  time=0.465s
+Epoch 974: loss=1861.379706  time=0.654s
+Epoch 975: loss=2318.390917  time=0.569s
+Epoch 976: loss=2033.825397  time=0.560s
+Epoch 977: loss=2048.004893  time=0.553s
+Epoch 978: loss=2023.461415  time=0.699s
+Epoch 979: loss=2476.895744  time=0.486s
+Epoch 980: loss=1907.465500  time=0.469s
+Epoch 981: loss=2122.078489  time=0.655s
+Epoch 982: loss=2056.374471  time=0.645s
+Epoch 983: loss=2150.662154  time=0.574s
+Epoch 984: loss=2370.267053  time=0.638s
+Epoch 985: loss=2092.595568  time=0.574s
+Epoch 986: loss=2037.419836  time=0.512s
+Epoch 987: loss=2083.568881  time=0.345s
+Epoch 988: loss=2268.469090  time=0.351s
+Epoch 989: loss=2009.139387  time=0.359s
+Epoch 990: loss=1915.222218  time=0.798s
+Epoch 991: loss=2171.255118  time=0.408s
+Epoch 992: loss=2008.833687  time=0.616s
+Epoch 993: loss=2298.413230  time=0.422s
+Epoch 994: loss=2210.937440  time=0.517s
+Epoch 995: loss=1931.546786  time=0.481s
+Epoch 996: loss=2144.825568  time=0.633s
+Epoch 997: loss=1762.648334  time=0.615s
+Epoch 998: loss=2198.901027  time=0.525s
+Epoch 999: loss=1887.525760  time=0.577s
+Epoch 1000: loss=1799.234607  time=0.681s
+Saved model state to: out_reg_csv\torch_linear_model.pth
+
+=== Final evaluation on test set ===
+MSE  : 1455.966675
+RMSE : 38.157131
+R^2  : 0.960313
+Saved prediction preview to: out_reg_csv\predictions_preview.csv
+Saved training history (epoch loss/time) to: out_reg_csv\training_history.csv
+
+Sample predictions (first 10 rows of preview):
+row 0: feature_1=7.538, feature_2=7.393, feature_3=4.433, feature_4=24.570, feature_5=9.966, feature_6=28.925  | true=158.589  pred=151.825
+row 1: feature_1=18.290, feature_2=25.257, feature_3=71.727, feature_4=37.588, feature_5=68.748, feature_6=51.411  | true=537.272  pred=530.720
+row 2: feature_1=26.670, feature_2=56.769, feature_3=56.638, feature_4=8.373, feature_5=53.942, feature_6=96.438  | true=442.052  pred=491.555
+row 3: feature_1=40.952, feature_2=80.125, feature_3=13.191, feature_4=96.280, feature_5=36.154, feature_6=50.483  | true=254.637  pred=243.091
+row 4: feature_1=63.226, feature_2=70.936, feature_3=45.502, feature_4=5.183, feature_5=87.365, feature_6=12.930  | true=334.019  pred=287.779
+row 5: feature_1=27.035, feature_2=17.153, feature_3=9.890, feature_4=15.613, feature_5=55.215, feature_6=93.758  | true=355.329  pred=298.491
+row 6: feature_1=95.300, feature_2=75.746, feature_3=67.511, feature_4=87.438, feature_5=21.725, feature_6=34.917  | true=642.151  pred=629.201
+row 7: feature_1=61.773, feature_2=72.300, feature_3=0.739, feature_4=35.220, feature_5=2.643, feature_6=56.075  | true=196.044  pred=182.828
+row 8: feature_1=36.548, feature_2=34.382, feature_3=27.931, feature_4=32.073, feature_5=13.968, feature_6=1.292  | true=234.001  pred=190.753
+row 9: feature_1=80.072, feature_2=87.722, feature_3=32.387, feature_4=95.299, feature_5=49.366, feature_6=87.240  | true=534.861  pred=603.719
+
+Artifacts saved in: out_reg_csv
+ - model state: out_reg_csv\torch_linear_model.pth
+ - scaler: out_reg_csv\scaler.pkl
+ - predictions preview: out_reg_csv\predictions_preview.csv
+ - training history: out_reg_csv\training_history.csv
+(venv) (base) PS C:\Users\aswin\Desktop\csai\regression> code train_from_csv.py
+(venv) (base) PS C:\Users\aswin\Desktop\csai\regression> .\venv\Scripts\python.exe train_from_csv.py --csv train_data.csv --target target --epochs 1000 --batch-size 512 --lr 0.0006
+Loading CSV dataset...
+Loaded dataset with 38000 samples and 6 features.
+Feature columns: ['feature_1', 'feature_2', 'feature_3', 'feature_4', 'feature_5', 'feature_6']
+Train samples: 30400, Test samples: 7600
+Saved scaler to: out_reg_csv\scaler.pkl
+Using device: cpu
+Traceback (most recent call last):
+  File "C:\Users\aswin\Desktop\csai\regression\train_from_csv.py", line 178, in <module>
+    main()
+  File "C:\Users\aswin\Desktop\csai\regression\train_from_csv.py", line 129, in main
+    optimizer = torch.optim.SGD(model.parameters(), lr=args.lr)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\aswin\Desktop\csai\regression\venv\Lib\site-packages\torch\optim\sgd.py", line 65, in __init__
+    super().__init__(params, defaults)
+  File "C:\Users\aswin\Desktop\csai\regression\venv\Lib\site-packages\torch\optim\optimizer.py", line 401, in __init__
+    self.add_param_group(cast(dict, param_group))
+  File "C:\Users\aswin\Desktop\csai\regression\venv\Lib\site-packages\torch\_compile.py", line 46, in inner
+    import torch._dynamo
+  File "C:\Users\aswin\Desktop\csai\regression\venv\Lib\site-packages\torch\_dynamo\__init__.py", line 13, in <module>
+    from . import (
+  File "C:\Users\aswin\Desktop\csai\regression\venv\Lib\site-packages\torch\_dynamo\aot_compile.py", line 15, in <module>
+    from . import convert_frame
+  File "C:\Users\aswin\Desktop\csai\regression\venv\Lib\site-packages\torch\_dynamo\convert_frame.py", line 57, in <module>
+    from torch._dynamo.symbolic_convert import TensorifyState
+  File "C:\Users\aswin\Desktop\csai\regression\venv\Lib\site-packages\torch\_dynamo\symbolic_convert.py", line 53, in <module>
+    from torch._dynamo.exc import ObservedException, TensorifyScalarRestartAnalysis
+  File "C:\Users\aswin\Desktop\csai\regression\venv\Lib\site-packages\torch\_dynamo\exc.py", line 45, in <module>
+    from .utils import counters
+  File "C:\Users\aswin\Desktop\csai\regression\venv\Lib\site-packages\torch\_dynamo\utils.py", line 67, in <module>
+    import torch.fx.experimental.symbolic_shapes
+  File "C:\Users\aswin\Desktop\csai\regression\venv\Lib\site-packages\torch\fx\experimental\symbolic_shapes.py", line 3, in <module>
+    import sympy
+  File "C:\Users\aswin\Desktop\csai\regression\venv\Lib\site-packages\sympy\__init__.py", line 31, in <module>
+    from sympy.core.cache import lazy_function
+  File "C:\Users\aswin\Desktop\csai\regression\venv\Lib\site-packages\sympy\core\__init__.py", line 9, in <module>
+    from .expr import Expr, AtomicExpr, UnevaluatedExpr
+  File "C:\Users\aswin\Desktop\csai\regression\venv\Lib\site-packages\sympy\core\expr.py", line 4188, in <module>
+    from .mul import Mul
+  File "C:\Users\aswin\Desktop\csai\regression\venv\Lib\site-packages\sympy\core\mul.py", line 2212, in <module>
+    from .numbers import Rational
+  File "C:\Users\aswin\Desktop\csai\regression\venv\Lib\site-packages\sympy\core\numbers.py", line 4467, in <module>
+    from .power import Pow
+  File "C:\Users\aswin\Desktop\csai\regression\venv\Lib\site-packages\sympy\core\power.py", line 10, in <module>
+    from .function import (expand_complex, expand_multinomial,
+  File "C:\Users\aswin\Desktop\csai\regression\venv\Lib\site-packages\sympy\core\function.py", line 281, in <module>
+    class Application(Basic, metaclass=FunctionClass):
+  File "C:\Users\aswin\Desktop\csai\regression\venv\Lib\site-packages\sympy\core\function.py", line 189, in __init__
+    cls._nargs = nargs
+    ^^^^^^^^^^
+MemoryError: Out of memory interning an attribute name
+(venv) (base) PS C:\Users\aswin\Desktop\csai\regression> .\venv\Scripts\python.exe train_from_csv.py --csv train_data.csv --target target --epochs 1000 --batch-size 512 --lr 0.0005
+Loading CSV dataset...
+Loaded dataset with 38000 samples and 6 features.
+Feature columns: ['feature_1', 'feature_2', 'feature_3', 'feature_4', 'feature_5', 'feature_6']
+Train samples: 30400, Test samples: 7600
+Saved scaler to: out_reg_csv\scaler.pkl
+Using device: cpu
+
+Starting training...
+Epoch 001: loss=249614.679688  time=0.602s
+Epoch 002: loss=220995.742448  time=0.673s
+Epoch 003: loss=195966.970833  time=0.505s
+Epoch 004: loss=173672.760417  time=0.532s
+Epoch 005: loss=154125.844010  time=0.564s
+Epoch 006: loss=136720.323698  time=0.616s
+Epoch 007: loss=121167.535547  time=0.479s
+Epoch 008: loss=107380.032422  time=0.447s
+Epoch 009: loss=95273.062240  time=0.746s
+Epoch 010: loss=84454.949870  time=0.444s
+Epoch 011: loss=74975.408073  time=0.596s
+Epoch 012: loss=66448.086263  time=0.531s
+Epoch 013: loss=58956.972331  time=0.576s
+Epoch 014: loss=52254.645182  time=0.568s
+Epoch 015: loss=46377.848698  time=0.505s
+Epoch 016: loss=41106.838607  time=0.535s
+Epoch 017: loss=36471.729980  time=0.735s
+Epoch 018: loss=32355.212793  time=0.591s
+Epoch 019: loss=28695.635254  time=0.629s
+Epoch 020: loss=25452.226628  time=0.533s
+Epoch 021: loss=22596.324609  time=0.596s
+Epoch 022: loss=20049.326204  time=0.528s
+Epoch 023: loss=17784.638005  time=0.541s
+Epoch 024: loss=15779.891536  time=0.748s
+Epoch 025: loss=14008.133366  time=0.581s
+Epoch 026: loss=12420.944808  time=0.556s
+Epoch 027: loss=11042.996208  time=0.494s
+Epoch 028: loss=9795.106478  time=0.591s
+Epoch 029: loss=8688.510856  time=0.633s
+Epoch 030: loss=7723.962329  time=0.580s
+Epoch 031: loss=6852.533472  time=0.777s
+Epoch 032: loss=6095.974764  time=0.553s
+Epoch 033: loss=5415.667163  time=0.558s
+Epoch 034: loss=4810.855257  time=0.612s
+Epoch 035: loss=4277.373958  time=0.552s
+Epoch 036: loss=3799.645931  time=0.508s
+Epoch 037: loss=3381.089933  time=0.540s
+Epoch 038: loss=3013.948250  time=0.755s
+Epoch 039: loss=2683.962569  time=0.562s
+Epoch 040: loss=2392.205375  time=0.553s
+Epoch 041: loss=2131.065365  time=0.530s
+Epoch 042: loss=1899.693778  time=0.588s
+Epoch 043: loss=1695.738542  time=0.613s
+Epoch 044: loss=1514.718298  time=0.576s
+Epoch 045: loss=1353.885895  time=0.758s
+Epoch 046: loss=1213.014785  time=0.529s
+Epoch 047: loss=1086.804512  time=0.504s
+Epoch 048: loss=974.993869  time=0.596s
+Epoch 049: loss=875.504711  time=0.626s
+Epoch 050: loss=788.848734  time=0.566s
+Epoch 051: loss=710.545836  time=0.579s
+Epoch 052: loss=641.177809  time=0.721s
+Epoch 053: loss=578.764641  time=0.512s
+Epoch 054: loss=524.845599  time=0.535s
+Epoch 055: loss=476.677315  time=0.641s
+Epoch 056: loss=433.969588  time=0.525s
+Epoch 057: loss=396.581263  time=0.538s
+Epoch 058: loss=362.785913  time=0.570s
+Epoch 059: loss=333.413760  time=0.818s
+Epoch 060: loss=307.196114  time=0.562s
+Epoch 061: loss=282.878135  time=0.540s
+Epoch 062: loss=262.301668  time=0.566s
+Epoch 063: loss=243.916259  time=0.508s
+Epoch 064: loss=227.830181  time=0.531s
+Epoch 065: loss=213.294040  time=0.644s
+Epoch 066: loss=200.438936  time=0.679s
+Epoch 067: loss=188.746968  time=0.459s
+Epoch 068: loss=179.017885  time=0.592s
+Epoch 069: loss=169.969434  time=0.613s
+Epoch 070: loss=161.939747  time=0.578s
+Epoch 071: loss=154.798909  time=0.567s
+Epoch 072: loss=148.561302  time=0.547s
+Epoch 073: loss=143.261017  time=0.697s
+Epoch 074: loss=138.276926  time=0.534s
+Epoch 075: loss=134.086080  time=0.556s
+Epoch 076: loss=130.060778  time=0.591s
+Epoch 077: loss=126.681804  time=0.484s
+Epoch 078: loss=123.647639  time=0.527s
+Epoch 079: loss=121.124756  time=0.559s
+Epoch 080: loss=118.638781  time=0.779s
+Epoch 081: loss=116.555404  time=0.550s
+Epoch 082: loss=114.526801  time=0.574s
+Epoch 083: loss=113.028904  time=0.535s
+Epoch 084: loss=111.484440  time=0.491s
+Epoch 085: loss=109.886403  time=0.471s
+Epoch 086: loss=108.991017  time=0.575s
+Epoch 087: loss=108.039246  time=0.664s
+Epoch 088: loss=107.185035  time=0.507s
+Epoch 089: loss=106.265289  time=0.508s
+Epoch 090: loss=105.379748  time=0.551s
+Epoch 091: loss=104.891927  time=0.447s
+Epoch 092: loss=104.383052  time=0.444s
+Epoch 093: loss=103.901926  time=0.462s
+Epoch 094: loss=103.232798  time=0.580s
+Epoch 095: loss=102.915594  time=0.454s
+Epoch 096: loss=102.619062  time=0.472s
+Epoch 097: loss=102.396728  time=0.400s
+Epoch 098: loss=102.076682  time=0.411s
+Epoch 099: loss=101.677270  time=0.464s
+Epoch 100: loss=101.529420  time=0.527s
+Epoch 101: loss=101.419454  time=0.771s
+Epoch 102: loss=101.116090  time=0.706s
+Epoch 103: loss=100.992689  time=0.511s
+Epoch 104: loss=101.102279  time=0.398s
+Epoch 105: loss=100.930873  time=0.604s
+Epoch 106: loss=100.724665  time=0.630s
+Epoch 107: loss=100.621719  time=0.410s
+Epoch 108: loss=100.370664  time=0.327s
+Epoch 109: loss=100.568144  time=0.272s
+Epoch 110: loss=100.573510  time=0.590s
+Epoch 111: loss=100.424646  time=0.379s
+Epoch 112: loss=100.198759  time=0.433s
+Epoch 113: loss=100.331623  time=0.582s
+Epoch 114: loss=100.357606  time=0.438s
+Epoch 115: loss=100.326935  time=0.464s
+Epoch 116: loss=100.029117  time=0.354s
+Epoch 117: loss=100.309367  time=0.594s
+Epoch 118: loss=100.044814  time=0.693s
+Epoch 119: loss=99.874000  time=0.615s
+Epoch 120: loss=100.071748  time=0.563s
+Epoch 121: loss=100.016847  time=0.676s
+Epoch 122: loss=100.079734  time=0.824s
+Epoch 123: loss=100.041098  time=0.523s
+Epoch 124: loss=100.168586  time=0.493s
+Epoch 125: loss=100.072498  time=0.724s
+Epoch 126: loss=99.992726  time=0.672s
+Epoch 127: loss=99.872570  time=0.584s
+Epoch 128: loss=100.042100  time=0.649s
+Epoch 129: loss=99.836745  time=0.704s
+Epoch 130: loss=100.052253  time=0.586s
+Epoch 131: loss=100.298318  time=0.642s
+Epoch 132: loss=100.003437  time=0.574s
+Epoch 133: loss=99.888105  time=0.505s
+Epoch 134: loss=100.028349  time=0.619s
+Epoch 135: loss=99.989800  time=0.742s
+Epoch 136: loss=99.990295  time=0.834s
+Epoch 137: loss=99.930754  time=0.518s
+Epoch 138: loss=99.862675  time=0.447s
+Epoch 139: loss=99.918568  time=0.464s
+Epoch 140: loss=99.981627  time=0.479s
+Epoch 141: loss=99.834337  time=0.569s
+Epoch 142: loss=99.969091  time=0.538s
+Epoch 143: loss=99.820255  time=0.592s
+Epoch 144: loss=99.823508  time=0.421s
+Epoch 145: loss=99.989236  time=0.428s
+Epoch 146: loss=99.809934  time=0.608s
+Epoch 147: loss=99.995083  time=0.603s
+Epoch 148: loss=99.682608  time=0.609s
+Epoch 149: loss=100.240113  time=0.600s
+Epoch 150: loss=100.084315  time=0.655s
+Epoch 151: loss=99.885333  time=0.660s
+Epoch 152: loss=99.892613  time=0.503s
+Epoch 153: loss=99.848659  time=0.452s
+Epoch 154: loss=99.891004  time=0.564s
+Epoch 155: loss=100.109688  time=0.621s
+Epoch 156: loss=99.764748  time=0.630s
+Epoch 157: loss=99.865406  time=0.711s
+Epoch 158: loss=99.858709  time=0.443s
+Epoch 159: loss=99.889242  time=0.582s
+Epoch 160: loss=99.875461  time=0.602s
+Epoch 161: loss=99.782874  time=0.602s
+Epoch 162: loss=99.837293  time=0.564s
+Epoch 163: loss=99.942707  time=0.595s
+Epoch 164: loss=100.033717  time=0.743s
+Epoch 165: loss=99.907166  time=0.557s
+Epoch 166: loss=99.765759  time=0.514s
+Epoch 167: loss=100.153766  time=0.608s
+Epoch 168: loss=99.844512  time=0.498s
+Epoch 169: loss=99.881442  time=0.347s
+Epoch 170: loss=99.919280  time=0.606s
+Epoch 171: loss=100.081665  time=0.716s
+Epoch 172: loss=99.791773  time=0.492s
+Epoch 173: loss=100.039556  time=0.617s
+Epoch 174: loss=99.970909  time=0.526s
+Epoch 175: loss=99.897077  time=0.551s
+Epoch 176: loss=99.888941  time=0.576s
+Epoch 177: loss=100.081465  time=0.589s
+Epoch 178: loss=100.092959  time=0.750s
+Epoch 179: loss=99.833131  time=0.470s
+Epoch 180: loss=99.874750  time=0.629s
+Epoch 181: loss=99.870141  time=0.583s
+Epoch 182: loss=99.861769  time=0.533s
+Epoch 183: loss=99.915534  time=0.630s
+Epoch 184: loss=100.130432  time=0.600s
+Epoch 185: loss=99.912085  time=0.559s
+Epoch 186: loss=99.952322  time=0.436s
+Epoch 187: loss=99.958235  time=0.709s
+Epoch 188: loss=99.967808  time=0.646s
+Epoch 189: loss=99.915965  time=0.555s
+Epoch 190: loss=99.832290  time=0.639s
+Epoch 191: loss=99.834427  time=0.505s
+Epoch 192: loss=100.019806  time=0.746s
+Epoch 193: loss=99.912709  time=0.544s
+Epoch 194: loss=99.830724  time=0.597s
+Epoch 195: loss=99.936193  time=0.561s
+Epoch 196: loss=99.779727  time=0.553s
+Epoch 197: loss=99.969995  time=0.514s
+Epoch 198: loss=99.876250  time=0.578s
+Epoch 199: loss=99.980876  time=0.766s
+Epoch 200: loss=99.788060  time=0.617s
+Epoch 201: loss=99.711825  time=0.544s
+Epoch 202: loss=99.841652  time=0.501s
+Epoch 203: loss=100.155933  time=0.466s
+Epoch 204: loss=99.910922  time=0.617s
+Epoch 205: loss=100.041357  time=0.408s
+Epoch 206: loss=99.862466  time=0.634s
+Epoch 207: loss=99.927009  time=0.432s
+Epoch 208: loss=99.923073  time=0.630s
+Epoch 209: loss=99.820102  time=0.540s
+Epoch 210: loss=99.994068  time=0.231s
+Epoch 211: loss=99.917039  time=0.262s
+Epoch 212: loss=99.880146  time=0.319s
+Epoch 213: loss=99.910810  time=0.779s
+Epoch 214: loss=99.952656  time=0.505s
+Epoch 215: loss=99.937297  time=0.509s
+Epoch 216: loss=99.920981  time=0.471s
+Epoch 217: loss=99.959591  time=0.604s
+Epoch 218: loss=99.921149  time=0.619s
+Epoch 219: loss=99.791404  time=0.452s
+Epoch 220: loss=99.859824  time=0.816s
+Epoch 221: loss=99.931915  time=0.525s
+Epoch 222: loss=99.985976  time=0.539s
+Epoch 223: loss=99.723625  time=0.604s
+Epoch 224: loss=99.958563  time=0.522s
+Epoch 225: loss=99.933779  time=0.574s
+Epoch 226: loss=99.911290  time=0.564s
+Epoch 227: loss=99.918345  time=0.756s
+Epoch 228: loss=99.830393  time=0.475s
+Epoch 229: loss=100.136008  time=0.532s
+Epoch 230: loss=99.870838  time=0.670s
+Epoch 231: loss=99.946042  time=0.541s
+Epoch 232: loss=100.046703  time=0.476s
+Epoch 233: loss=99.920527  time=0.518s
+Epoch 234: loss=100.020848  time=0.631s
+Epoch 235: loss=99.879910  time=0.503s
+Epoch 236: loss=99.838466  time=0.479s
+Epoch 237: loss=99.854255  time=0.398s
+Epoch 238: loss=99.790953  time=0.524s
+Epoch 239: loss=99.899628  time=0.454s
+Epoch 240: loss=99.781992  time=0.536s
+Epoch 241: loss=99.888968  time=0.691s
+Epoch 242: loss=99.893341  time=0.598s
+Epoch 243: loss=99.830519  time=0.539s
+Epoch 244: loss=99.946765  time=0.550s
+Epoch 245: loss=100.064572  time=0.615s
+Epoch 246: loss=99.837439  time=0.420s
+Epoch 247: loss=99.975822  time=0.510s
+Epoch 248: loss=99.832644  time=0.752s
+Epoch 249: loss=99.994777  time=0.581s
+Epoch 250: loss=100.014401  time=0.508s
+Epoch 251: loss=100.213819  time=0.562s
+Epoch 252: loss=99.906287  time=0.624s
+Epoch 253: loss=99.878855  time=0.577s
+Epoch 254: loss=99.845155  time=0.586s
+Epoch 255: loss=99.992900  time=0.702s
+Epoch 256: loss=99.805061  time=0.610s
+Epoch 257: loss=100.097362  time=0.562s
+Epoch 258: loss=100.043102  time=0.583s
+Epoch 259: loss=99.844315  time=0.575s
+Epoch 260: loss=100.115590  time=0.555s
+Epoch 261: loss=99.811863  time=0.482s
+Epoch 262: loss=99.900682  time=0.748s
+Epoch 263: loss=99.947714  time=0.557s
+Epoch 264: loss=99.819044  time=0.548s
+Epoch 265: loss=99.937063  time=0.519s
+Epoch 266: loss=99.989257  time=0.632s
+Epoch 267: loss=99.831284  time=0.559s
+Epoch 268: loss=99.883606  time=0.651s
+Epoch 269: loss=99.999316  time=0.725s
+Epoch 270: loss=99.799089  time=0.405s
+Epoch 271: loss=99.789215  time=0.557s
+Epoch 272: loss=100.048420  time=0.697s
+Epoch 273: loss=99.909057  time=0.609s
+Epoch 274: loss=99.830492  time=0.547s
+Epoch 275: loss=99.827549  time=0.559s
+Epoch 276: loss=99.880481  time=0.805s
+Epoch 277: loss=99.782194  time=0.500s
+Epoch 278: loss=99.898792  time=0.566s
+Epoch 279: loss=100.057774  time=0.496s
+Epoch 280: loss=99.900281  time=0.585s
+Epoch 281: loss=99.912398  time=0.521s
+Epoch 282: loss=99.928954  time=0.601s
+Epoch 283: loss=99.704747  time=0.554s
+Epoch 284: loss=100.082662  time=0.168s
+Epoch 285: loss=99.933410  time=0.173s
+Epoch 286: loss=100.255902  time=0.166s
+Epoch 287: loss=99.983053  time=0.166s
+Epoch 288: loss=100.010655  time=0.185s
+Epoch 289: loss=99.850394  time=0.191s
+Epoch 290: loss=100.119124  time=0.275s
+Epoch 291: loss=99.798398  time=0.164s
+Epoch 292: loss=100.010772  time=0.165s
+Epoch 293: loss=99.839412  time=0.166s
+Epoch 294: loss=99.796060  time=0.169s
+Epoch 295: loss=99.788443  time=0.162s
+Epoch 296: loss=99.844935  time=0.202s
+Epoch 297: loss=99.941391  time=0.350s
+Epoch 298: loss=99.791406  time=0.265s
+Epoch 299: loss=100.216073  time=0.273s
+Epoch 300: loss=100.053567  time=0.354s
+Epoch 301: loss=100.025225  time=0.427s
+Epoch 302: loss=99.955520  time=0.375s
+Epoch 303: loss=99.772592  time=0.372s
+Epoch 304: loss=99.992298  time=0.491s
+Epoch 305: loss=99.838250  time=0.183s
+Epoch 306: loss=99.924367  time=0.170s
+Epoch 307: loss=99.967999  time=0.169s
+Epoch 308: loss=99.840884  time=0.315s
+Epoch 309: loss=99.956659  time=0.240s
+Epoch 310: loss=99.922117  time=0.291s
+Epoch 311: loss=100.024056  time=0.318s
+Epoch 312: loss=99.973692  time=0.408s
+Epoch 313: loss=99.919475  time=0.300s
+Epoch 314: loss=99.795596  time=0.296s
+Epoch 315: loss=99.879649  time=0.280s
+Epoch 316: loss=99.974800  time=0.321s
+Epoch 317: loss=99.705070  time=0.356s
+Epoch 318: loss=100.034930  time=0.479s
+Epoch 319: loss=99.843401  time=0.426s
+Epoch 320: loss=99.813426  time=0.327s
+Epoch 321: loss=99.921650  time=0.370s
+Epoch 322: loss=99.819020  time=0.310s
+Epoch 323: loss=100.003823  time=0.362s
+Epoch 324: loss=99.989442  time=0.240s
+Epoch 325: loss=99.953366  time=0.447s
+Epoch 326: loss=99.951544  time=0.283s
+Epoch 327: loss=100.035397  time=0.344s
+Epoch 328: loss=99.961890  time=0.275s
+Epoch 329: loss=99.713161  time=0.344s
+Epoch 330: loss=99.866871  time=0.267s
+Epoch 331: loss=99.848196  time=0.316s
+Epoch 332: loss=100.042906  time=0.503s
+Epoch 333: loss=99.879270  time=0.316s
+Epoch 334: loss=99.832699  time=0.224s
+Epoch 335: loss=99.861558  time=0.212s
+Epoch 336: loss=99.715556  time=0.299s
+Epoch 337: loss=100.172390  time=0.292s
+Epoch 338: loss=99.972069  time=0.374s
+Epoch 339: loss=100.007666  time=0.378s
+Epoch 340: loss=99.672360  time=0.445s
+Epoch 341: loss=100.022206  time=0.480s
+Epoch 342: loss=99.926188  time=0.458s
+Epoch 343: loss=99.793275  time=0.279s
+Epoch 344: loss=99.840971  time=0.271s
+Epoch 345: loss=99.836864  time=0.208s
+Epoch 346: loss=99.926131  time=0.394s
+Epoch 347: loss=99.811864  time=0.301s
+Epoch 348: loss=99.817832  time=0.193s
+Epoch 349: loss=99.944763  time=0.269s
+Epoch 350: loss=99.861536  time=0.340s
+Epoch 351: loss=99.926702  time=0.246s
+Epoch 352: loss=99.754302  time=0.319s
+Epoch 353: loss=99.918940  time=0.500s
+Epoch 354: loss=99.915049  time=0.295s
+Epoch 355: loss=99.774797  time=0.261s
+Epoch 356: loss=99.983363  time=0.190s
+Epoch 357: loss=99.909401  time=0.302s
+Epoch 358: loss=99.984425  time=0.270s
+Epoch 359: loss=99.871570  time=0.291s
+Epoch 360: loss=99.983104  time=0.437s
+Epoch 361: loss=99.898668  time=0.365s
+Epoch 362: loss=99.850881  time=0.351s
+Epoch 363: loss=100.028035  time=0.215s
+Epoch 364: loss=99.840299  time=0.237s
+Epoch 365: loss=99.903622  time=0.288s
+Epoch 366: loss=100.053003  time=0.516s
+Epoch 367: loss=99.974144  time=0.396s
+Epoch 368: loss=100.098116  time=0.309s
+Epoch 369: loss=99.831589  time=0.259s
+Epoch 370: loss=99.882579  time=0.214s
+Epoch 371: loss=99.867380  time=0.207s
+Epoch 372: loss=99.934734  time=0.203s
+Epoch 373: loss=100.056493  time=0.192s
+Epoch 374: loss=100.118952  time=0.547s
+Epoch 375: loss=99.830949  time=0.358s
+Epoch 376: loss=99.999504  time=0.273s
+Epoch 377: loss=99.817588  time=0.252s
+Epoch 378: loss=100.082026  time=0.193s
+Epoch 379: loss=100.089803  time=0.187s
+Epoch 380: loss=99.758884  time=0.221s
+Epoch 381: loss=99.757404  time=0.361s
+Epoch 382: loss=99.778276  time=0.300s
+Epoch 383: loss=100.108362  time=0.285s
+Epoch 384: loss=99.954715  time=0.334s
+Epoch 385: loss=99.910450  time=0.187s
+Epoch 386: loss=99.817033  time=0.276s
+Epoch 387: loss=99.721293  time=0.407s
+Epoch 388: loss=99.799102  time=0.346s
+Epoch 389: loss=99.961126  time=0.361s
+Epoch 390: loss=99.966807  time=0.325s
+Epoch 391: loss=99.839071  time=0.212s
+Epoch 392: loss=99.846581  time=0.194s
+Epoch 393: loss=99.927118  time=0.334s
+Epoch 394: loss=99.878894  time=0.241s
+Epoch 395: loss=99.894467  time=0.343s
+Epoch 396: loss=99.835133  time=0.325s
+Epoch 397: loss=99.905182  time=0.184s
+Epoch 398: loss=100.027148  time=0.186s
+Epoch 399: loss=99.798259  time=0.311s
+Epoch 400: loss=99.964470  time=0.215s
+Epoch 401: loss=99.786913  time=0.226s
+Epoch 402: loss=100.005723  time=0.426s
+Epoch 403: loss=99.864672  time=0.291s
+Epoch 404: loss=99.916022  time=0.317s
+Epoch 405: loss=99.948896  time=0.341s
+Epoch 406: loss=100.021912  time=0.220s
+Epoch 407: loss=99.995642  time=0.250s
+Epoch 408: loss=99.948774  time=0.253s
+Epoch 409: loss=99.938194  time=0.512s
+Epoch 410: loss=100.023476  time=0.288s
+Epoch 411: loss=99.819855  time=0.263s
+Epoch 412: loss=99.934823  time=0.207s
+Epoch 413: loss=99.972214  time=0.189s
+Epoch 414: loss=99.872500  time=0.251s
+Epoch 415: loss=99.909046  time=0.286s
+Epoch 416: loss=99.849849  time=0.389s
+Epoch 417: loss=99.877323  time=0.325s
+Epoch 418: loss=99.921837  time=0.519s
+Epoch 419: loss=99.905011  time=0.432s
+Epoch 420: loss=99.768697  time=0.176s
+Epoch 421: loss=99.943293  time=0.189s
+Epoch 422: loss=99.887351  time=0.223s
+Epoch 423: loss=99.989604  time=0.497s
+Epoch 424: loss=99.677689  time=0.402s
+Epoch 425: loss=99.915877  time=0.255s
+Epoch 426: loss=99.835685  time=0.305s
+Epoch 427: loss=99.664054  time=0.250s
+Epoch 428: loss=100.016564  time=0.235s
+Epoch 429: loss=100.004318  time=0.328s
+Epoch 430: loss=99.941647  time=0.535s
+Epoch 431: loss=99.777246  time=0.275s
+Epoch 432: loss=99.987257  time=0.304s
+Epoch 433: loss=99.889684  time=0.241s
+Epoch 434: loss=99.951911  time=0.265s
+Epoch 435: loss=100.004227  time=0.363s
+Epoch 436: loss=99.919385  time=0.247s
+Epoch 437: loss=99.805443  time=0.492s
+Epoch 438: loss=99.923352  time=0.369s
+Epoch 439: loss=99.942831  time=0.215s
+Epoch 440: loss=99.761872  time=0.219s
+Epoch 441: loss=100.066765  time=0.220s
+Epoch 442: loss=99.675812  time=0.215s
+Epoch 443: loss=100.000510  time=0.419s
+Epoch 444: loss=99.862955  time=0.441s
+Epoch 445: loss=99.919464  time=0.354s
+Epoch 446: loss=99.918104  time=0.260s
+Epoch 447: loss=99.932573  time=0.238s
+Epoch 448: loss=99.902440  time=0.240s
+Epoch 449: loss=100.059477  time=0.334s
+Epoch 450: loss=100.137767  time=0.313s
+Epoch 451: loss=99.888692  time=0.529s
+Epoch 452: loss=99.933863  time=0.388s
+Epoch 453: loss=99.686259  time=0.258s
+Epoch 454: loss=99.937164  time=0.370s
+Epoch 455: loss=99.837599  time=0.333s
+Epoch 456: loss=99.896265  time=0.277s
+Epoch 457: loss=99.964487  time=0.298s
+Epoch 458: loss=99.894636  time=0.380s
+Epoch 459: loss=100.010304  time=0.269s
+Epoch 460: loss=99.913648  time=0.352s
+Epoch 461: loss=99.941757  time=0.254s
+Epoch 462: loss=99.796691  time=0.308s
+Epoch 463: loss=99.910077  time=0.256s
+Epoch 464: loss=99.705722  time=0.410s
+Epoch 465: loss=100.090359  time=0.521s
+Epoch 466: loss=99.987776  time=0.260s
+Epoch 467: loss=99.892083  time=0.305s
+Epoch 468: loss=99.895739  time=0.376s
+Epoch 469: loss=99.912809  time=0.290s
+Epoch 470: loss=99.797522  time=0.223s
+Epoch 471: loss=99.875902  time=0.351s
+Epoch 472: loss=99.938920  time=0.453s
+Epoch 473: loss=99.931330  time=0.334s
+Epoch 474: loss=99.910058  time=0.295s
+Epoch 475: loss=99.829328  time=0.324s
+Epoch 476: loss=99.988156  time=0.343s
+Epoch 477: loss=100.070548  time=0.282s
+Epoch 478: loss=99.757068  time=0.229s
+Epoch 479: loss=99.865849  time=0.361s
+Epoch 480: loss=99.800035  time=0.219s
+Epoch 481: loss=99.736647  time=0.274s
+Epoch 482: loss=100.017965  time=0.361s
+Epoch 483: loss=99.843749  time=0.260s
+Epoch 484: loss=99.983878  time=0.284s
+Epoch 485: loss=99.929317  time=0.219s
+Epoch 486: loss=99.802851  time=0.476s
+Epoch 487: loss=99.930181  time=0.353s
+Epoch 488: loss=99.968079  time=0.405s
+Epoch 489: loss=99.942400  time=0.343s
+Epoch 490: loss=99.997429  time=0.301s
+Epoch 491: loss=100.004282  time=0.339s
+Epoch 492: loss=99.823224  time=0.276s
+Epoch 493: loss=100.055401  time=0.483s
+Epoch 494: loss=99.904996  time=0.391s
+Epoch 495: loss=100.137447  time=0.369s
+Epoch 496: loss=100.021386  time=0.273s
+Epoch 497: loss=99.878020  time=0.399s
+Epoch 498: loss=99.820607  time=0.354s
+Epoch 499: loss=99.963557  time=0.246s
+Epoch 500: loss=99.842344  time=0.423s
+Epoch 501: loss=99.951647  time=0.352s
+Epoch 502: loss=99.927196  time=0.403s
+Epoch 503: loss=99.962373  time=0.394s
+Epoch 504: loss=99.882371  time=0.363s
+Epoch 505: loss=99.920759  time=0.339s
+Epoch 506: loss=100.111979  time=0.290s
+Epoch 507: loss=99.814312  time=0.431s
+Epoch 508: loss=100.158649  time=0.375s
+Epoch 509: loss=99.879655  time=0.297s
+Epoch 510: loss=100.077427  time=0.326s
+Epoch 511: loss=99.923231  time=0.317s
+Epoch 512: loss=99.950108  time=0.423s
+Epoch 513: loss=99.821543  time=0.313s
+Epoch 514: loss=100.045813  time=0.428s
+Epoch 515: loss=99.825144  time=0.358s
+Epoch 516: loss=99.972235  time=0.240s
+Epoch 517: loss=100.020595  time=0.268s
+Epoch 518: loss=100.051163  time=0.272s
+Epoch 519: loss=100.220523  time=0.286s
+Epoch 520: loss=99.775599  time=0.264s
+Epoch 521: loss=99.869710  time=0.466s
+Epoch 522: loss=99.997390  time=0.301s
+Epoch 523: loss=99.750054  time=0.400s
+Epoch 524: loss=99.965946  time=0.412s
+Epoch 525: loss=99.870248  time=0.260s
+Epoch 526: loss=99.891618  time=0.241s
+Epoch 527: loss=100.160336  time=0.224s
+Epoch 528: loss=99.878419  time=0.493s
+Epoch 529: loss=99.811915  time=0.327s
+Epoch 530: loss=99.965606  time=0.315s
+Epoch 531: loss=99.968793  time=0.325s
+Epoch 532: loss=99.892992  time=0.265s
+Epoch 533: loss=99.886861  time=0.301s
+Epoch 534: loss=99.976119  time=0.318s
+Epoch 535: loss=99.833356  time=0.539s
+Epoch 536: loss=99.722913  time=0.220s
+Epoch 537: loss=99.914334  time=0.230s
+Epoch 538: loss=99.854095  time=0.454s
+Epoch 539: loss=100.138750  time=0.516s
+Epoch 540: loss=99.874979  time=0.305s
+Epoch 541: loss=100.225523  time=0.209s
+Epoch 542: loss=99.863506  time=0.432s
+Epoch 543: loss=99.710366  time=0.337s
+Epoch 544: loss=99.795110  time=0.329s
+Epoch 545: loss=99.917878  time=0.382s
+Epoch 546: loss=99.870246  time=0.359s
+Epoch 547: loss=100.072849  time=0.331s
+Epoch 548: loss=99.646614  time=0.312s
+Epoch 549: loss=99.883743  time=0.454s
+Epoch 550: loss=99.844705  time=0.368s
+Epoch 551: loss=100.030929  time=0.423s
+Epoch 552: loss=99.887517  time=0.301s
+Epoch 553: loss=99.908032  time=0.358s
+Epoch 554: loss=99.861186  time=0.374s
+Epoch 555: loss=100.037017  time=0.382s
+Epoch 556: loss=99.966352  time=0.542s
+Epoch 557: loss=99.771223  time=0.378s
+Epoch 558: loss=99.898222  time=0.238s
+Epoch 559: loss=99.948389  time=0.415s
+Epoch 560: loss=100.005850  time=0.295s
+Epoch 561: loss=99.990079  time=0.469s
+Epoch 562: loss=100.027402  time=0.383s
+Epoch 563: loss=100.047462  time=0.580s
+Epoch 564: loss=99.985785  time=0.406s
+Epoch 565: loss=100.073253  time=0.372s
+Epoch 566: loss=99.983478  time=0.448s
+Epoch 567: loss=100.018454  time=0.288s
+Epoch 568: loss=99.993713  time=0.293s
+Epoch 569: loss=99.890832  time=0.361s
+Epoch 570: loss=99.778912  time=0.417s
+Epoch 571: loss=99.929538  time=0.420s
+Epoch 572: loss=99.992531  time=0.317s
+Epoch 573: loss=99.971246  time=0.262s
+Epoch 574: loss=99.930416  time=0.255s
+Epoch 575: loss=99.836624  time=0.261s
+Epoch 576: loss=100.063484  time=0.224s
+Epoch 577: loss=99.970078  time=0.344s
+Epoch 578: loss=99.853285  time=0.404s
+Epoch 579: loss=99.934966  time=0.345s
+Epoch 580: loss=99.906355  time=0.252s
+Epoch 581: loss=99.773357  time=0.302s
+Epoch 582: loss=99.894090  time=0.328s
+Epoch 583: loss=100.080274  time=0.307s
+Epoch 584: loss=99.832326  time=0.465s
+Epoch 585: loss=100.018524  time=0.325s
+Epoch 586: loss=99.950999  time=0.295s
+Epoch 587: loss=100.040015  time=0.390s
+Epoch 588: loss=99.762464  time=0.297s
+Epoch 589: loss=99.820551  time=0.292s
+Epoch 590: loss=99.908182  time=0.325s
+Epoch 591: loss=100.089947  time=0.451s
+Epoch 592: loss=99.832040  time=0.296s
+Epoch 593: loss=99.811463  time=0.283s
+Epoch 594: loss=99.700413  time=0.240s
+Epoch 595: loss=99.872123  time=0.258s
+Epoch 596: loss=99.983618  time=0.265s
+Epoch 597: loss=99.786420  time=0.462s
+Epoch 598: loss=99.986479  time=0.581s
+Epoch 599: loss=100.044548  time=0.335s
+Epoch 600: loss=99.874373  time=0.262s
+Epoch 601: loss=99.988973  time=0.230s
+Epoch 602: loss=99.923023  time=0.424s
+Epoch 603: loss=100.010598  time=0.344s
+Epoch 604: loss=100.042197  time=0.218s
+Epoch 605: loss=99.778062  time=0.489s
+Epoch 606: loss=99.984628  time=0.324s
+Epoch 607: loss=99.936780  time=0.277s
+Epoch 608: loss=99.917829  time=0.422s
+Epoch 609: loss=99.827639  time=0.313s
+Epoch 610: loss=99.942727  time=0.304s
+Epoch 611: loss=100.132079  time=0.334s
+Epoch 612: loss=100.042125  time=0.370s
+Epoch 613: loss=99.926336  time=0.284s
+Epoch 614: loss=99.801950  time=0.447s
+Epoch 615: loss=99.925961  time=0.376s
+Epoch 616: loss=99.871143  time=0.287s
+Epoch 617: loss=99.922609  time=0.429s
+Epoch 618: loss=99.823486  time=0.375s
+Epoch 619: loss=100.022581  time=0.583s
+Epoch 620: loss=100.163344  time=0.379s
+Epoch 621: loss=99.809875  time=0.354s
+Epoch 622: loss=99.873617  time=0.300s
+Epoch 623: loss=99.741774  time=0.283s
+Epoch 624: loss=99.879035  time=0.370s
+Epoch 625: loss=99.900957  time=0.470s
+Epoch 626: loss=99.886948  time=0.373s
+Epoch 627: loss=99.918384  time=0.295s
+Epoch 628: loss=99.926660  time=0.393s
+Epoch 629: loss=99.866185  time=0.347s
+Epoch 630: loss=99.814396  time=0.492s
+Epoch 631: loss=99.942104  time=0.372s
+Epoch 632: loss=99.951203  time=0.283s
+Epoch 633: loss=100.051428  time=0.453s
+Epoch 634: loss=99.929072  time=0.235s
+Epoch 635: loss=99.824907  time=0.417s
+Epoch 636: loss=99.994717  time=0.418s
+Epoch 637: loss=100.010822  time=0.302s
+Epoch 638: loss=99.913697  time=0.244s
+Epoch 639: loss=99.957095  time=0.264s
+Epoch 640: loss=99.975278  time=0.445s
+Epoch 641: loss=99.905838  time=0.566s
+Epoch 642: loss=99.848870  time=0.341s
+Epoch 643: loss=100.047688  time=0.369s
+Epoch 644: loss=100.001750  time=0.345s
+Epoch 645: loss=99.899298  time=0.373s
+Epoch 646: loss=99.774393  time=0.450s
+Epoch 647: loss=99.851601  time=0.554s
+Epoch 648: loss=99.864948  time=0.269s
+Epoch 649: loss=99.922882  time=0.384s
+Epoch 650: loss=99.944473  time=0.295s
+Epoch 651: loss=100.006642  time=0.342s
+Epoch 652: loss=100.002619  time=0.468s
+Epoch 653: loss=99.961044  time=0.302s
+Epoch 654: loss=99.768215  time=0.521s
+Epoch 655: loss=99.935814  time=0.315s
+Epoch 656: loss=100.103157  time=0.368s
+Epoch 657: loss=100.181860  time=0.503s
+Epoch 658: loss=99.763247  time=0.354s
+Epoch 659: loss=99.797860  time=0.384s
+Epoch 660: loss=99.896787  time=0.346s
+Epoch 661: loss=100.063707  time=0.485s
+Epoch 662: loss=99.955341  time=0.390s
+Epoch 663: loss=99.820897  time=0.255s
+Epoch 664: loss=99.890681  time=0.314s
+Epoch 665: loss=99.866180  time=0.267s
+Epoch 666: loss=100.039894  time=0.279s
+Epoch 667: loss=100.179031  time=0.363s
+Epoch 668: loss=99.836163  time=0.703s
+Epoch 669: loss=99.892495  time=0.320s
+Epoch 670: loss=100.036951  time=0.374s
+Epoch 671: loss=99.825831  time=0.331s
+Epoch 672: loss=99.853608  time=0.478s
+Epoch 673: loss=99.904408  time=0.463s
+Epoch 674: loss=99.896562  time=0.377s
+Epoch 675: loss=99.885792  time=0.385s
+Epoch 676: loss=99.915411  time=0.350s
+Epoch 677: loss=99.871500  time=0.535s
+Epoch 678: loss=99.977872  time=0.408s
+Epoch 679: loss=99.990367  time=0.354s
+Epoch 680: loss=99.945097  time=0.311s
+Epoch 681: loss=99.893215  time=0.353s
+Epoch 682: loss=99.968226  time=0.561s
+Epoch 683: loss=100.011406  time=0.439s
+Epoch 684: loss=99.708257  time=0.392s
+Epoch 685: loss=100.033500  time=0.256s
+Epoch 686: loss=99.814463  time=0.303s
+Epoch 687: loss=99.839693  time=0.329s
+Epoch 688: loss=99.930716  time=0.487s
+Epoch 689: loss=99.760977  time=0.457s
+Epoch 690: loss=99.980211  time=0.400s
+Epoch 691: loss=99.904927  time=0.405s
+Epoch 692: loss=99.890863  time=0.331s
+Epoch 693: loss=99.878805  time=0.531s
+Epoch 694: loss=99.899467  time=0.267s
+Epoch 695: loss=99.976277  time=0.460s
+Epoch 696: loss=100.028188  time=0.450s
+Epoch 697: loss=99.913960  time=0.339s
+Epoch 698: loss=99.857567  time=0.402s
+Epoch 699: loss=99.942648  time=0.385s
+Epoch 700: loss=100.075996  time=0.372s
+Epoch 701: loss=100.053980  time=0.325s
+Epoch 702: loss=99.838796  time=0.349s
+Epoch 703: loss=99.886960  time=0.744s
+Epoch 704: loss=100.024297  time=0.284s
+Epoch 705: loss=99.944789  time=0.250s
+Epoch 706: loss=99.750517  time=0.423s
+Epoch 707: loss=99.994852  time=0.316s
+Epoch 708: loss=99.934394  time=0.611s
+Epoch 709: loss=99.803852  time=0.410s
+Epoch 710: loss=99.705755  time=0.539s
+Epoch 711: loss=99.975944  time=0.310s
+Epoch 712: loss=99.876330  time=0.389s
+Epoch 713: loss=99.938618  time=0.480s
+Epoch 714: loss=99.843410  time=0.348s
+Epoch 715: loss=99.792900  time=0.285s
+Epoch 716: loss=99.922778  time=0.232s
+Epoch 717: loss=100.125970  time=0.358s
+Epoch 718: loss=99.907536  time=0.512s
+Epoch 719: loss=99.910434  time=0.341s
+Epoch 720: loss=99.913158  time=0.342s
+Epoch 721: loss=99.997900  time=0.346s
+Epoch 722: loss=100.149340  time=0.269s
+Epoch 723: loss=99.947597  time=0.250s
+Epoch 724: loss=99.893583  time=0.502s
+Epoch 725: loss=99.847608  time=0.374s
+Epoch 726: loss=99.909510  time=0.358s
+Epoch 727: loss=100.206552  time=0.380s
+Epoch 728: loss=99.789590  time=0.302s
+Epoch 729: loss=99.952020  time=0.303s
+Epoch 730: loss=99.974755  time=0.520s
+Epoch 731: loss=100.021255  time=0.484s
+Epoch 732: loss=99.824881  time=0.342s
+Epoch 733: loss=99.912696  time=0.311s
+Epoch 734: loss=99.942513  time=0.424s
+Epoch 735: loss=100.034182  time=0.395s
+Epoch 736: loss=99.913673  time=0.269s
+Epoch 737: loss=99.913136  time=0.282s
+Epoch 738: loss=99.975562  time=0.711s
+Epoch 739: loss=99.885797  time=0.335s
+Epoch 740: loss=99.869549  time=0.306s
+Epoch 741: loss=99.914967  time=0.366s
+Epoch 742: loss=99.906395  time=0.450s
+Epoch 743: loss=99.884657  time=0.489s
+Epoch 744: loss=99.840122  time=0.340s
+Epoch 745: loss=100.003285  time=0.475s
+Epoch 746: loss=99.885719  time=0.465s
+Epoch 747: loss=100.066550  time=0.423s
+Epoch 748: loss=99.972356  time=0.442s
+Epoch 749: loss=100.058832  time=0.359s
+Epoch 750: loss=99.759128  time=0.390s
+Epoch 751: loss=99.924385  time=0.289s
+Epoch 752: loss=100.007273  time=0.501s
+Epoch 753: loss=99.952242  time=0.280s
+Epoch 754: loss=99.919062  time=0.382s
+Epoch 755: loss=99.835618  time=0.521s
+Epoch 756: loss=99.854144  time=0.248s
+Epoch 757: loss=100.052069  time=0.381s
+Epoch 758: loss=99.730875  time=0.377s
+Epoch 759: loss=99.906032  time=0.529s
+Epoch 760: loss=99.913236  time=0.362s
+Epoch 761: loss=99.789978  time=0.376s
+Epoch 762: loss=99.896957  time=0.272s
+Epoch 763: loss=100.181837  time=0.333s
+Epoch 764: loss=99.802966  time=0.325s
+Epoch 765: loss=100.009226  time=0.301s
+Epoch 766: loss=99.955155  time=0.427s
+Epoch 767: loss=99.986745  time=0.349s
+Epoch 768: loss=99.905107  time=0.433s
+Epoch 769: loss=99.979336  time=0.523s
+Epoch 770: loss=99.946042  time=0.319s
+Epoch 771: loss=99.880121  time=0.353s
+Epoch 772: loss=100.026808  time=0.378s
+Epoch 773: loss=99.801807  time=0.547s
+Epoch 774: loss=99.792284  time=0.373s
+Epoch 775: loss=99.800736  time=0.281s
+Epoch 776: loss=99.729076  time=0.462s
+Epoch 777: loss=99.865113  time=0.380s
+Epoch 778: loss=99.866988  time=0.399s
+Epoch 779: loss=99.821562  time=0.323s
+Epoch 780: loss=99.849044  time=0.472s
+Epoch 781: loss=100.024263  time=0.479s
+Epoch 782: loss=99.854396  time=0.420s
+Epoch 783: loss=100.087610  time=0.358s
+Epoch 784: loss=99.868232  time=0.318s
+Epoch 785: loss=99.948998  time=0.462s
+Epoch 786: loss=99.923909  time=0.481s
+Epoch 787: loss=99.814641  time=0.573s
+Epoch 788: loss=99.913574  time=0.358s
+Epoch 789: loss=99.912931  time=0.337s
+Epoch 790: loss=100.015095  time=0.278s
+Epoch 791: loss=99.983652  time=0.407s
+Epoch 792: loss=99.927691  time=0.415s
+Epoch 793: loss=99.968707  time=0.439s
+Epoch 794: loss=99.942512  time=0.601s
+Epoch 795: loss=100.014556  time=0.505s
+Epoch 796: loss=99.850440  time=0.389s
+Epoch 797: loss=100.075858  time=0.366s
+Epoch 798: loss=99.896569  time=0.309s
+Epoch 799: loss=99.746333  time=0.451s
+Epoch 800: loss=99.827010  time=0.428s
+Epoch 801: loss=99.950199  time=0.733s
+Epoch 802: loss=99.924338  time=0.398s
+Epoch 803: loss=100.037795  time=0.404s
+Epoch 804: loss=99.814272  time=0.401s
+Epoch 805: loss=100.003237  time=0.298s
+Epoch 806: loss=100.141828  time=0.291s
+Epoch 807: loss=99.938912  time=0.374s
+Epoch 808: loss=100.080191  time=0.629s
+Epoch 809: loss=99.931618  time=0.535s
+Epoch 810: loss=99.806401  time=0.362s
+Epoch 811: loss=99.981237  time=0.269s
+Epoch 812: loss=99.825080  time=0.533s
+Epoch 813: loss=100.036691  time=0.358s
+Epoch 814: loss=99.895428  time=0.470s
+Epoch 815: loss=100.056132  time=0.441s
+Epoch 816: loss=100.038920  time=0.251s
+Epoch 817: loss=99.904256  time=0.271s
+Epoch 818: loss=99.933382  time=0.473s
+Epoch 819: loss=99.783225  time=0.431s
+Epoch 820: loss=99.914402  time=0.344s
+Epoch 821: loss=99.940491  time=0.289s
+Epoch 822: loss=99.836668  time=0.492s
+Epoch 823: loss=100.053468  time=0.433s
+Epoch 824: loss=100.099934  time=0.413s
+Epoch 825: loss=99.895641  time=0.429s
+Epoch 826: loss=99.750100  time=0.260s
+Epoch 827: loss=100.054301  time=0.265s
+Epoch 828: loss=99.849063  time=0.362s
+Epoch 829: loss=99.789996  time=0.530s
+Epoch 830: loss=99.972029  time=0.334s
+Epoch 831: loss=99.953374  time=0.310s
+Epoch 832: loss=100.018975  time=0.239s
+Epoch 833: loss=99.928139  time=0.370s
+Epoch 834: loss=99.840599  time=0.470s
+Epoch 835: loss=99.970525  time=0.281s
+Epoch 836: loss=99.812484  time=0.531s
+Epoch 837: loss=99.855783  time=0.354s
+Epoch 838: loss=100.202813  time=0.385s
+Epoch 839: loss=100.014512  time=0.333s
+Epoch 840: loss=99.831950  time=0.395s
+Epoch 841: loss=99.821329  time=0.425s
+Epoch 842: loss=99.775677  time=0.312s
+Epoch 843: loss=99.896388  time=0.540s
+Epoch 844: loss=100.082251  time=0.344s
+Epoch 845: loss=99.976014  time=0.353s
+Epoch 846: loss=99.967304  time=0.461s
+Epoch 847: loss=99.943758  time=0.401s
+Epoch 848: loss=99.981241  time=0.345s
+Epoch 849: loss=99.944479  time=0.357s
+Epoch 850: loss=100.053962  time=0.435s
+Epoch 851: loss=99.767010  time=0.411s
+Epoch 852: loss=99.921815  time=0.425s
+Epoch 853: loss=99.874749  time=0.244s
+Epoch 854: loss=99.959472  time=0.279s
+Epoch 855: loss=99.827428  time=0.503s
+Epoch 856: loss=99.843798  time=0.236s
+Epoch 857: loss=100.045833  time=0.448s
+Epoch 858: loss=100.003674  time=0.275s
+Epoch 859: loss=99.810966  time=0.241s
+Epoch 860: loss=99.966675  time=0.374s
+Epoch 861: loss=99.764549  time=0.500s
+Epoch 862: loss=99.774415  time=0.426s
+Epoch 863: loss=99.956266  time=0.403s
+Epoch 864: loss=99.955361  time=0.417s
+Epoch 865: loss=99.919167  time=0.382s
+Epoch 866: loss=99.962994  time=0.371s
+Epoch 867: loss=100.012226  time=0.360s
+Epoch 868: loss=99.956762  time=0.478s
+Epoch 869: loss=99.888640  time=0.458s
+Epoch 870: loss=100.117952  time=0.362s
+Epoch 871: loss=99.947714  time=0.578s
+Epoch 872: loss=99.956685  time=0.453s
+Epoch 873: loss=99.798672  time=0.347s
+Epoch 874: loss=99.895846  time=0.247s
+Epoch 875: loss=99.965033  time=0.366s
+Epoch 876: loss=99.995846  time=0.438s
+Epoch 877: loss=99.880720  time=0.388s
+Epoch 878: loss=99.898467  time=0.424s
+Epoch 879: loss=99.929488  time=0.284s
+Epoch 880: loss=99.936967  time=0.259s
+Epoch 881: loss=99.843176  time=0.447s
+Epoch 882: loss=99.691862  time=0.377s
+Epoch 883: loss=99.902805  time=0.346s
+Epoch 884: loss=100.001882  time=0.313s
+Epoch 885: loss=99.865644  time=0.420s
+Epoch 886: loss=99.962871  time=0.465s
+Epoch 887: loss=99.799178  time=0.341s
+Epoch 888: loss=100.045912  time=0.282s
+Epoch 889: loss=99.941389  time=0.373s
+Epoch 890: loss=99.830328  time=0.290s
+Epoch 891: loss=99.885428  time=0.216s
+Epoch 892: loss=100.028902  time=0.565s
+Epoch 893: loss=99.927673  time=0.322s
+Epoch 894: loss=100.059526  time=0.338s
+Epoch 895: loss=99.967260  time=0.525s
+Epoch 896: loss=99.902147  time=0.222s
+Epoch 897: loss=99.930392  time=0.316s
+Epoch 898: loss=99.925377  time=0.468s
+Epoch 899: loss=99.925893  time=0.389s
+Epoch 900: loss=99.882961  time=0.412s
+Epoch 901: loss=100.036855  time=0.336s
+Epoch 902: loss=99.915751  time=0.260s
+Epoch 903: loss=99.931745  time=0.333s
+Epoch 904: loss=99.891606  time=0.537s
+Epoch 905: loss=99.922130  time=0.359s
+Epoch 906: loss=100.136004  time=0.626s
+Epoch 907: loss=99.855371  time=0.340s
+Epoch 908: loss=100.058941  time=0.451s
+Epoch 909: loss=99.742326  time=0.279s
+Epoch 910: loss=100.040520  time=0.379s
+Epoch 911: loss=99.733506  time=0.390s
+Epoch 912: loss=99.742741  time=0.349s
+Epoch 913: loss=100.069442  time=0.605s
+Epoch 914: loss=99.767788  time=0.316s
+Epoch 915: loss=99.951851  time=0.404s
+Epoch 916: loss=100.073694  time=0.402s
+Epoch 917: loss=99.942494  time=0.279s
+Epoch 918: loss=99.775905  time=0.544s
+Epoch 919: loss=99.906420  time=0.343s
+Epoch 920: loss=99.982217  time=0.513s
+Epoch 921: loss=100.070522  time=0.389s
+Epoch 922: loss=99.813437  time=0.343s
+Epoch 923: loss=99.912134  time=0.487s
+Epoch 924: loss=99.821439  time=0.276s
+Epoch 925: loss=99.815948  time=0.400s
+Epoch 926: loss=99.926471  time=0.390s
+Epoch 927: loss=99.886424  time=0.332s
+Epoch 928: loss=100.086235  time=0.339s
+Epoch 929: loss=99.957706  time=0.413s
+Epoch 930: loss=99.923567  time=0.312s
+Epoch 931: loss=99.865875  time=0.293s
+Epoch 932: loss=100.062295  time=0.284s
+Epoch 933: loss=99.820364  time=0.235s
+Epoch 934: loss=99.947522  time=0.497s
+Epoch 935: loss=100.051954  time=0.436s
+Epoch 936: loss=99.769305  time=0.274s
+Epoch 937: loss=99.827737  time=0.232s
+Epoch 938: loss=99.901292  time=0.225s
+Epoch 939: loss=100.092182  time=0.287s
+Epoch 940: loss=99.867468  time=0.457s
+Epoch 941: loss=99.969968  time=0.523s
+Epoch 942: loss=99.975279  time=0.225s
+Epoch 943: loss=100.015288  time=0.298s
+Epoch 944: loss=99.873273  time=0.299s
+Epoch 945: loss=99.835645  time=0.271s
+Epoch 946: loss=100.109710  time=0.326s
+Epoch 947: loss=100.068649  time=0.525s
+Epoch 948: loss=99.892449  time=0.478s
+Epoch 949: loss=100.009259  time=0.475s
+Epoch 950: loss=100.115505  time=0.275s
+Epoch 951: loss=100.168803  time=0.386s
+Epoch 952: loss=100.127425  time=0.404s
+Epoch 953: loss=99.791953  time=0.273s
+Epoch 954: loss=99.991654  time=0.311s
+Epoch 955: loss=99.790025  time=0.428s
+Epoch 956: loss=99.990627  time=0.299s
+Epoch 957: loss=99.935237  time=0.480s
+Epoch 958: loss=99.733030  time=0.335s
+Epoch 959: loss=100.120753  time=0.296s
+Epoch 960: loss=100.008016  time=0.371s
+Epoch 961: loss=99.927512  time=0.268s
+Epoch 962: loss=99.818294  time=0.445s
+Epoch 963: loss=99.785834  time=0.423s
+Epoch 964: loss=99.737211  time=0.239s
+Epoch 965: loss=99.937949  time=0.344s
+Epoch 966: loss=99.705822  time=0.239s
+Epoch 967: loss=99.799362  time=0.308s
+Epoch 968: loss=99.809488  time=0.240s
+Epoch 969: loss=99.856070  time=0.603s
+Epoch 970: loss=99.912323  time=0.318s
+Epoch 971: loss=99.909731  time=0.415s
+Epoch 972: loss=99.782947  time=0.312s
+Epoch 973: loss=99.800544  time=0.315s
+Epoch 974: loss=100.015067  time=0.427s
+Epoch 975: loss=99.941091  time=0.281s
+Epoch 976: loss=99.880338  time=0.375s
+Epoch 977: loss=99.875873  time=0.258s
+Epoch 978: loss=100.191866  time=0.375s
+Epoch 979: loss=99.904145  time=0.286s
+Epoch 980: loss=99.885263  time=0.505s
+Epoch 981: loss=99.984123  time=0.400s
+Epoch 982: loss=99.955111  time=0.233s
+Epoch 983: loss=99.807502  time=0.482s
+Epoch 984: loss=99.709392  time=0.285s
+Epoch 985: loss=99.845028  time=0.456s
+Epoch 986: loss=99.855742  time=0.464s
+Epoch 987: loss=99.884838  time=0.333s
+Epoch 988: loss=99.876808  time=0.240s
+Epoch 989: loss=99.699896  time=0.254s
+Epoch 990: loss=99.877006  time=0.425s
+Epoch 991: loss=99.857332  time=0.348s
+Epoch 992: loss=99.889484  time=0.405s
+Epoch 993: loss=100.005688  time=0.230s
+Epoch 994: loss=99.883045  time=0.369s
+Epoch 995: loss=100.195025  time=0.274s
+Epoch 996: loss=100.152740  time=0.247s
+Epoch 997: loss=99.987025  time=0.471s
+Epoch 998: loss=100.029273  time=0.427s
+Epoch 999: loss=99.802663  time=0.234s
+Epoch 1000: loss=100.118423  time=0.338s
+Saved model state to: out_reg_csv\torch_linear_model.pth
+
+=== Final evaluation on test set ===
+MSE  : 99.259163
+RMSE : 9.962889
+R^2  : 0.997294
+Saved prediction preview to: out_reg_csv\predictions_preview.csv
+Saved training history (epoch loss/time) to: out_reg_csv\training_history.csv
+
+Sample predictions (first 10 rows of preview):
+row 0: feature_1=7.538, feature_2=7.393, feature_3=4.433, feature_4=24.570, feature_5=9.966, feature_6=28.925  | true=158.589  pred=144.422
+row 1: feature_1=18.290, feature_2=25.257, feature_3=71.727, feature_4=37.588, feature_5=68.748, feature_6=51.411  | true=537.272  pred=525.064
+row 2: feature_1=26.670, feature_2=56.769, feature_3=56.638, feature_4=8.373, feature_5=53.942, feature_6=96.438  | true=442.052  pred=451.287
+row 3: feature_1=40.952, feature_2=80.125, feature_3=13.191, feature_4=96.280, feature_5=36.154, feature_6=50.483  | true=254.637  pred=268.612
+row 4: feature_1=63.226, feature_2=70.936, feature_3=45.502, feature_4=5.183, feature_5=87.365, feature_6=12.930  | true=334.019  pred=320.252
+row 5: feature_1=27.035, feature_2=17.153, feature_3=9.890, feature_4=15.613, feature_5=55.215, feature_6=93.758  | true=355.329  pred=377.669
+row 6: feature_1=95.300, feature_2=75.746, feature_3=67.511, feature_4=87.438, feature_5=21.725, feature_6=34.917  | true=642.151  pred=627.544
+row 7: feature_1=61.773, feature_2=72.300, feature_3=0.739, feature_4=35.220, feature_5=2.643, feature_6=56.075  | true=196.044  pred=204.532
+row 8: feature_1=36.548, feature_2=34.382, feature_3=27.931, feature_4=32.073, feature_5=13.968, feature_6=1.292  | true=234.001  pred=214.695
+row 9: feature_1=80.072, feature_2=87.722, feature_3=32.387, feature_4=95.299, feature_5=49.366, feature_6=87.240  | true=534.861  pred=552.648
+
+Artifacts saved in: out_reg_csv
+ - model state: out_reg_csv\torch_linear_model.pth
+ - scaler: out_reg_csv\scaler.pkl
+ - predictions preview: out_reg_csv\predictions_preview.csv
+ - training history: out_reg_csv\training_history.csv
+(venv) (base) PS C:\Users\aswin\Desktop\csai\regression>
