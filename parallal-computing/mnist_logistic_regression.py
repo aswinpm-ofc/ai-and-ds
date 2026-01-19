@@ -15,6 +15,11 @@ d. Visualize the decision boundary using PCA
 import numpy as np
 import matplotlib.pyplot as plt
 
+# OPTIONAL: Hide convergence warnings (uncomment if needed)
+# import warnings
+# from sklearn.exceptions import ConvergenceWarning
+# warnings.filterwarnings("ignore", category=ConvergenceWarning)
+
 from sklearn.datasets import fetch_openml
 from sklearn.model_selection import train_test_split, GridSearchCV
 from sklearn.preprocessing import StandardScaler
@@ -46,13 +51,14 @@ X_test = scaler.transform(X_test)
 # =========================
 print("\nTraining Logistic Regression model (simulated progress):")
 
-iteration_steps = [100, 200, 300, 400, 500, 700, 1000]
+iteration_steps = [200, 500, 1000, 1500, 2000, 2500, 3000]
 progress_acc = []
 
 for i, iters in enumerate(iteration_steps):
     model = LogisticRegression(
         max_iter=iters,
-        solver='lbfgs'
+        solver='lbfgs',
+        tol=1e-4
     )
     model.fit(X_train, y_train)
 
@@ -92,12 +98,12 @@ print(classification_report(y_test, y_pred))
 print("\nPerforming Grid Search CV...")
 
 param_grid = {
-    'C': [0.01, 0.1, 1, 10],
+    'C': [0.1, 1, 10],
     'solver': ['lbfgs', 'saga']
 }
 
 grid = GridSearchCV(
-    LogisticRegression(max_iter=1000),
+    LogisticRegression(max_iter=3000, tol=1e-4),
     param_grid,
     cv=3,
     scoring='accuracy',
@@ -112,8 +118,7 @@ print("Best CV Accuracy:", grid.best_score_)
 best_model = grid.best_estimator_
 y_pred_best = best_model.predict(X_test)
 
-print("Test Accuracy after tuning:",
-      accuracy_score(y_test, y_pred_best))
+print("Test Accuracy after tuning:", accuracy_score(y_test, y_pred_best))
 
 
 # =========================
@@ -128,7 +133,8 @@ X_pca = pca.fit_transform(X_train)
 # Train model on PCA-reduced data
 model_2d = LogisticRegression(
     solver='lbfgs',
-    max_iter=1000
+    max_iter=3000,
+    tol=1e-4
 )
 model_2d.fit(X_pca, y_train)
 
