@@ -59,4 +59,16 @@
     "eligibility": "Open to all semesters. Knowledge of Python and Flutter required.",
     "apply": "internal"
   }
+    {
+    "title": " Attendance System",
+    "org": "CS Dept Internal Project",
+    "type": "Project",
+    "location": "On-Campus",
+    "skills": "OpenCV, Python, Flutter",
+    "stipend": "Certificate + ₹5,000",
+    "deadline": "2026-04-25",
+    "desc": "Face-recognition based attendance system to be developed and deployed in production on campus.",
+    "eligibility": "Open to all semesters. Knowledge of Python and Flutter required.",
+    "apply": "internal"
+  }
 ]
