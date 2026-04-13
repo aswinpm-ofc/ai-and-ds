@@ -1,15 +1,114 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <title>CS Department Opportunities</title>
-    </head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>CS Department — Opportunities Board</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --purple-light: #EEEDFE; --purple-mid: #534AB7; --purple-dark: #3C3489;
+      --teal-light: #E1F5EE; --teal-dark: #085041; --teal-mid: #0F6E56;
+      --blue-light: #E6F1FB; --blue-mid: #185FA5; --blue-dark: #0C447C;
+      --amber-light: #FAEEDA; --amber-mid: #854F0B;
+      --coral-light: #FAECE7; --coral-mid: #993C1D; --coral-dark: #712B13;
+      --bg: #f5f4f0; --surface: #ffffff; --border: rgba(0,0,0,0.1);
+      --text: #1a1a1a; --text-muted: #666; --text-faint: #999;
+      --radius: 12px; --radius-sm: 8px;
+    }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; line-height: 1.5; }
+
+    /* HEADER */
+    .site-header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 1.2rem 1.5rem; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; }
+    .site-header h1 { font-size: 20px; font-weight: 700; color: var(--purple-dark); }
+    .last-updated { font-size: 11px; color: var(--text-faint); background: var(--bg); padding: 5px 12px; border-radius: 20px; border: 1px solid var(--border); }
+
+    /* CONTROLS */
+    .controls { background: var(--surface); border-bottom: 1px solid var(--border); padding: 0.85rem 1.5rem; display: flex; flex-wrap: wrap; align-items: center; gap: 12px; position: sticky; top: 0; z-index: 100; }
+    .search-wrap { position: relative; flex: 1; min-width: 240px; max-width: 400px; }
+    .search-wrap svg { position: absolute; left: 14px; top: 50%; transform: translateY(-50%); width: 16px; height: 16px; color: var(--text-faint); }
+    .search-box { width: 100%; padding: 10px 16px 10px 40px; border: 1px solid var(--border); border-radius: 999px; font-size: 14px; background: var(--bg); outline: none; transition: 0.2s; }
+    .search-box:focus { border-color: var(--purple-mid); background: var(--surface); }
+
+    .pill-group { display: flex; flex-wrap: wrap; gap: 8px; }
+    .pill { padding: 8px 18px; border: 1px solid var(--border); border-radius: 999px; font-size: 13px; font-weight: 500; cursor: pointer; background: var(--surface); color: var(--text-muted); transition: 0.2s; }
+    .pill.active { background: var(--purple-mid); border-color: var(--purple-mid); color: #fff; }
+
+    .sort-wrap { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+    .sort-select { padding: 8px 32px 8px 14px; border: 1px solid var(--border); border-radius: 999px; font-size: 13px; background: var(--bg); appearance: none; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%23666' stroke-width='1.5' fill='none'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: right 14px center; cursor: pointer; }
+
+    /* GRID & CARDS */
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 18px; padding: 1.5rem; }
+    .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 1.25rem; cursor: pointer; transition: 0.2s; display: flex; flex-direction: column; }
+    .card:hover { transform: translateY(-3px); border-color: var(--purple-mid); box-shadow: 0 8px 20px rgba(0,0,0,0.08); }
+    .card-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 12px; }
+    .org-logo { width: 44px; height: 44px; border-radius: 10px; display: flex; align-items: center; justify-content: center; font-weight: 700; }
+    
+    /* Badges */
+    .type-badge { font-size: 11px; padding: 4px 12px; border-radius: 20px; font-weight: 600; text-transform: uppercase; }
+    .type-Internship { background: var(--teal-light); color: var(--teal-dark); }
+    .type-Job        { background: var(--blue-light); color: var(--blue-dark); }
+    .type-Research   { background: var(--purple-light); color: var(--purple-dark); }
+    .type-Project    { background: var(--amber-light); color: var(--amber-mid); }
+
+    .tags { display: flex; flex-wrap: wrap; gap: 6px; margin: 12px 0; }
+    .tag { font-size: 11px; padding: 3px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; color: var(--text-muted); }
+    .card-footer { margin-top: auto; padding-top: 12px; border-top: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
+    .stipend { font-size: 14px; font-weight: 700; color: var(--teal-mid); }
+    .deadline.urgent { color: var(--coral-mid); font-weight: 700; }
+
+    /* MODAL */
+    .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 1000; align-items: center; justify-content: center; padding: 1.5rem; backdrop-filter: blur(4px); }
+    .modal-overlay.open { display: flex; }
+    .modal { background: var(--surface); border-radius: var(--radius); max-width: 550px; width: 100%; max-height: 90vh; overflow-y: auto; padding: 2rem; position: relative; }
+    .modal-close { position: absolute; top: 1.25rem; right: 1.25rem; background: var(--bg); border: none; width: 32px; height: 32px; border-radius: 50%; cursor: pointer; }
+    .apply-btn { display: block; width: 100%; padding: 14px; background: var(--purple-mid); color: #fff; border-radius: var(--radius-sm); text-align: center; text-decoration: none; font-weight: 600; margin-top: 20px; }
+  </style>
+</head>
 <body>
-  <script>
-  /* CONFIG: Paste your link here. 
-     - It can be a Google Sheets CSV URL
-     - Or a path to a local file like 'jobs.json' 
-  */
+
+<header class="site-header">
+  <div>
+    <h1>CS Department Opportunities</h1>
+    <p>Find internships, research, and projects</p>
+  </div>
+  <div class="last-updated" id="last-updated">Connecting...</div>
+</header>
+
+<div class="controls">
+  <div class="search-wrap">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
+    <input class="search-box" type="text" placeholder="Search roles or skills..." id="search">
+  </div>
+
+  <div class="pill-group">
+    <button class="pill active" data-filter="all">All</button>
+    <button class="pill" data-filter="Internship">Internships</button>
+    <button class="pill" data-filter="Job">Jobs</button>
+    <button class="pill" data-filter="Research">Research</button>
+    <button class="pill" data-filter="Project">Projects</button>
+  </div>
+
+  <div class="sort-wrap">
+    <select class="sort-select" id="sort">
+      <option value="newest">Newest First</option>
+      <option value="deadline">Closest Deadline</option>
+      <option value="stipend">Highest Stipend</option>
+      <option value="title">Title A–Z</option>
+    </select>
+  </div>
+</div>
+
+<div class="grid" id="grid">
+  </div>
+
+<div class="modal-overlay" id="modal">
+  <div class="modal" id="modal-content">
+    </div>
+</div>
+
+<script>
+  // UPDATED: Set this to your local filename or your CSV link
   const DATA_SOURCE = "jobs.json"; 
 
   let allJobs = [], activeFilter = "all", searchVal = "", sortVal = "newest";
@@ -26,7 +125,6 @@
       const res = await fetch(DATA_SOURCE);
       if (!res.ok) throw new Error("Fetch failed");
 
-      // Check if the data is JSON or CSV based on the URL or content-type
       const contentType = res.headers.get("content-type");
       if (DATA_SOURCE.endsWith(".json") || (contentType && contentType.includes("application/json"))) {
         allJobs = await res.json();
@@ -40,9 +138,9 @@
     } catch (e) {
       console.error(e);
       document.getElementById("grid").innerHTML = `
-        <div style="grid-column:1/-1; text-align:center;">
-          <p>⚠️ Could not load data from source.</p>
-          <button onclick="location.reload()" style="margin-top:10px; padding:8px 16px; border-radius:8px; border:1px solid #ddd; cursor:pointer;">Retry</button>
+        <div style="grid-column:1/-1; text-align:center; padding: 3rem;">
+          <p>⚠️ Error loading data. Please check if '${DATA_SOURCE}' exists.</p>
+          <button onclick="location.reload()" style="margin-top:10px; padding:8px 16px; cursor:pointer;">Retry</button>
         </div>`;
     }
   }
@@ -52,12 +150,9 @@
     if (lines.length === 0) return [];
     const headers = lines[0].split(",").map(h => h.trim().toLowerCase().replace(/"/g, ''));
     return lines.slice(1).map(line => {
-      // Regex to properly handle commas inside quoted strings in CSV
       const cols = line.match(/(".*?"|[^",\s]+)(?=\s*,|\s*$)/g) || [];
       const obj = {};
-      headers.forEach((h, i) => {
-        obj[h] = (cols[i] || "").replace(/^"|"$/g, "").trim();
-      });
+      headers.forEach((h, i) => { obj[h] = (cols[i] || "").replace(/^"|"$/g, "").trim(); });
       return obj;
     }).filter(j => j.title);
   }
@@ -81,7 +176,6 @@
       return matchType && matchSearch;
     });
 
-    // Sorting Logic
     filtered.sort((a, b) => {
       if (sortVal === "deadline") return daysLeft(a.deadline) - daysLeft(b.deadline);
       if (sortVal === "title") return a.title.localeCompare(b.title);
@@ -116,8 +210,8 @@
           <div class="tags">${tags}</div>
           <div class="card-footer">
             <div class="footer-left">
-              <div>📍 ${j.location}</div>
-              <div class="deadline ${dl <= 7 ? 'urgent' : ''}">⏰ ${dl <= 0 ? 'Closing Today' : dl + ' days left'}</div>
+              <div style="font-size:11px; color:var(--text-faint)">📍 ${j.location}</div>
+              <div class="deadline ${dl <= 7 ? 'urgent' : ''}" style="font-size:11px">⏰ ${dl <= 0 ? 'Closing Today' : dl + ' days left'}</div>
             </div>
             <div class="stipend">${j.stipend}</div>
           </div>
@@ -134,22 +228,18 @@
       <button class="modal-close" onclick="closeModal()">✕</button>
       <h2 style="margin-bottom:4px;">${j.title}</h2>
       <div style="color:var(--text-muted); font-size:14px; margin-bottom:20px;">${j.org} • ${j.type}</div>
-      
       <div style="margin-bottom:20px;">
         <label style="font-size:11px; font-weight:700; color:var(--text-faint); text-transform:uppercase;">Description</label>
         <p style="font-size:14px; margin-top:5px;">${j.desc}</p>
       </div>
-
       <div style="margin-bottom:20px;">
         <label style="font-size:11px; font-weight:700; color:var(--text-faint); text-transform:uppercase;">Eligibility</label>
         <p style="font-size:14px; margin-top:5px;">${j.eligibility}</p>
       </div>
-
       <div style="display:grid; grid-template-columns:1fr 1fr; gap:15px; background:var(--bg); padding:15px; border-radius:10px;">
         <div><small style="color:var(--text-faint);">Stipend</small><br><strong>${j.stipend}</strong></div>
         <div><small style="color:var(--text-faint);">Deadline</small><br><strong>${j.deadline}</strong></div>
       </div>
-
       <a href="${applyUrl}" target="_blank" class="apply-btn">Apply Now →</a>
     `;
     document.getElementById("modal").classList.add("open");
@@ -157,7 +247,6 @@
 
   function closeModal() { document.getElementById("modal").classList.remove("open"); }
   
-  // UI Event Listeners
   document.getElementById("search").addEventListener("input", e => { searchVal = e.target.value; render(); });
   document.getElementById("sort").addEventListener("change", e => { sortVal = e.target.value; render(); });
   document.querySelectorAll(".pill").forEach(p => p.addEventListener("click", () => {
@@ -167,9 +256,7 @@
     render();
   }));
 
-  // Initialize on load
   init();
 </script>
-       
 </body>
 </html>
