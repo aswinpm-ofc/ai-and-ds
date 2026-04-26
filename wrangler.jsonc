@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "opportunity-board",
+  "name": "opportunityboard",
   "compatibility_date": "2026-04-13",
   "observability": {
     "enabled": true
